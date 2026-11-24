@@ -456,6 +456,35 @@ mod tests {
         super::kernel(&decode(&denorm), false).unwrap();
     }
 
+    /// A float `v_cmpx` lowered by #1426 leaves EXEC as the compare in the lanes that were in
+    /// EXEC, not the compare alone (thehollowedone's program on #1269): EXEC = lanes 0–15, then
+    /// `v_cmpx_le_f32 0, v1` true in every lane, then `v_mov v2, 7` writes lanes 0–15 only.
+    #[test]
+    fn a_bridged_v_cmpx_keeps_the_lanes_outside_exec_out() {
+        if !gpu() {
+            return;
+        }
+        let lines: &[I] = &[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("V_CMPX_LE_F32", "ENC_VOPC", &[("SRC0", 128), ("VSRC1", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 135)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)]),
+            ENDPGM,
+        ];
+        let (dxil, _) = super::kernel(&decode(lines), false).unwrap_or_else(|e| panic!("{e}"));
+        let (s, v) = state(32);
+        let mut st = runner::KernelState::default();
+        st.sgpr.copy_from_slice(&s);
+        for (l, regs) in v.iter().enumerate() {
+            st.vgpr[l][..regs.len()].copy_from_slice(regs);
+        }
+        let out = runner::run(&dxil, &st, &[]).unwrap();
+        for l in 0..32 {
+            assert_eq!(out.vgpr[l][2], if l < 16 { 7 } else { 0 }, "lane {l}");
+        }
+    }
+
     /// An instruction lowered by #1426 that writes to `Lw`'s entry block after the program's
     /// blocks are written (scratch) gives a container, and runs.
     #[test]
