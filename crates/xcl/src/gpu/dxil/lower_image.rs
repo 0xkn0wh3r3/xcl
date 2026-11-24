@@ -670,7 +670,7 @@ impl Lw {
             let dd = if dim == 7 { self.s.m.extract(dims, 2) } else { one };
             let r = [w, hh, dd, one];
             let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
-            return self.image_result(vdata, &vals, false, act);
+            return self.image_result(vdata, &vals, d16, act);
         }
 
         if base == "get_resinfo" {
@@ -696,7 +696,7 @@ impl Lw {
             };
             let r = [w, hh, dd, n];
             let vals: Vec<Value> = comps.iter().map(|&c| r[c as usize]).collect();
-            return self.image_result(vdata, &vals, false, act);
+            return self.image_result(vdata, &vals, d16, act);
         }
 
         let ic: Vec<Value> = (0..body as usize).map(|k| compu(self, i_body + k)).collect();
