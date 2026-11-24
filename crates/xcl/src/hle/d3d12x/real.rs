@@ -3557,15 +3557,30 @@ fn compile_slots(bytes: usize) -> &'static Slots {
 /// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
 /// for). Logs its time, size and whether it was gated.
 fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() -> R) -> R {
+    driver_compile_identified(kind, bytes, gate, None, build)
+}
+
+/// `driver_compile`, with the translated program's hash and whether a driver blob was supplied.
+/// `XCL_PSO_TRACE=1` logs every entry into the driver; large compiles are always logged.
+fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, identity: Option<(u64, bool)>, build: impl FnOnce() -> R) -> R {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
     let slot = huge.then(|| big_compile_turn(compile_slots(bytes), big_compile_commit_free, super::pso_async::build_is_wanted)).flatten();
     let waited = waited.elapsed();
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    let trace = std::env::var("XCL_PSO_TRACE").is_ok_and(|v| v.trim() == "1");
+    if trace || bytes >= huge_pso_bytes() {
+        let identity = identity.map_or_else(String::new, |(hash, cached)| {
+            format!(", hash {hash:016x}, driver blob {}", if cached { "supplied" } else { "absent" })
+        });
+        crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{identity}");
+    }
     let started = std::time::Instant::now();
     let r = build();
-    if huge || bytes >= huge_pso_bytes() {
+    if trace || huge || bytes >= huge_pso_bytes() {
         crate::xlog_info!(
-            "D3D12.X: driver compile of a {kind} PSO: {bytes} B DXIL, {} ms{}",
+            "D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}",
             started.elapsed().as_millis(),
             match (huge, slot.is_some()) {
                 (true, true) => format!(", gated (waited {} ms)", waited.as_millis()),
@@ -3785,7 +3800,13 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     // in the background, a few at a time and within the commit left (each ~1.5 GB in the driver)
     let started = std::time::Instant::now();
-    let mut hr = driver_compile("compute", dxil.len(), gate_compute_driver_compile(cached.is_some()), || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv));
+    let mut hr = driver_compile_identified(
+        "compute",
+        dxil.len(),
+        gate_compute_driver_compile(cached.is_some()),
+        Some((key.0, cached.is_some())),
+        || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
+    );
     if hr < 0 && cached.is_some() {
         // a blob the driver does not take (another root signature at the same address…): compiled
         forget_compute_blob(key);
@@ -3793,7 +3814,13 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             driver_cache::note(false, disk.as_deref());
         }
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-        hr = driver_compile("compute retry", dxil.len(), gate_compute_driver_compile(false), || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv));
+        hr = driver_compile_identified(
+            "compute retry",
+            dxil.len(),
+            gate_compute_driver_compile(false),
+            Some((key.0, false)),
+            || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
+        );
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
