@@ -599,6 +599,20 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// Whether `c` is the same in every lane that reaches with its EXEC bit (`reach` and `e`):
+    /// then a lane deciding by its own bit decides as the whole wave does. Unknown (too large
+    /// to build) is no.
+    fn uniform_over(&mut self, reach: B, e: B, c: B) -> bool {
+        let Some(re) = self.bdd.within(|bdd| bdd.and(reach, e)) else { return false };
+        if self.bdd.implies(re, c) {
+            return true;
+        }
+        match self.bdd.within(|bdd| bdd.not(c)) {
+            Some(nc) => self.bdd.implies(re, nc),
+            None => false,
+        }
+    }
+
     /// The condition under which a lane takes the branch ending a block, and whether it is a
     /// lane mask's.
     fn cond(&mut self, st: &State, d: &Decoded, block: usize) -> R<(B, bool)> {
@@ -800,6 +814,17 @@ impl<'a> Lanes<'a> {
                         sum.guarded.push(d.pc);
                     }
                 }
+                // an SCC a mask op set, read by a scalar instruction: the console reads the whole
+                // wave's, each lane here its own bit, the same only where it is constant over EXEC
+                let n = d.inst.name;
+                if ["S_CSELECT", "S_CMOV", "S_ADDC", "S_SUBB"].iter().any(|p| n.starts_with(p)) {
+                    if let Some((c, true)) = st.scc {
+                        let e = st.regs[EXEC].unwrap();
+                        if !self.uniform_over(reach[b], e, c) {
+                            return Err("a scalar read of the SCC of a mask op, with lanes in EXEC without its bit");
+                        }
+                    }
+                }
                 if d.inst.name == if self.wave64 { "S_WQM_B64" } else { "S_WQM_B32" } {
                     let s0 = rdna2::field_value(d.enc, &d.words, "SSRC0").unwrap_or(0);
                     if self.mask_src(&st, d, s0).and_then(|a| self.wqm(a)) == Some(TRUE) {
@@ -810,6 +835,13 @@ impl<'a> Lanes<'a> {
             }
             let last = &self.insts[end - 1];
             if self.succ[b].iter().any(|s| s.1 != Edge::Always) {
+                let (c, lane) = self.cond_bounded(&st, last, b)?;
+                // a lane branch is each lane's only where the condition is constant over the lanes
+                // in EXEC (`s_and_saveexec` then `s_cbranch_execz`); `s_cbranch_vccz` on a mask some
+                // lanes in EXEC lack takes the whole wave's way on the console (Kalmarv, #1745)
+                if lane && !self.uniform_over(reach[b], st.regs[EXEC].unwrap(), c) {
+                    return Err("a branch on whether any lane of a mask is set, with lanes in EXEC without its bit");
+                }
                 let (_, lane) = self.cond_bounded(&st, last, b)?;
                 if lane {
                     sum.lane_branches += 1;
@@ -967,10 +999,16 @@ mod tests {
     }
 
     #[test]
-    fn a_vccz_branch_is_a_lane_branch() {
-        // v_cmp; s_cbranch_vccz L; v_mov (lanes with the bit only); L: v_mov
-        let s = run(&[CMP, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV2, MOV3, ENDPGM]).unwrap();
-        assert_eq!((s.vector, s.guarded.len(), s.lane_branches), (2, 0, 1));
+    fn a_vccz_branch_is_a_lane_branch_only_where_vcc_is_the_exec() {
+        // v_cmp; s_cbranch_vccz L: the console skips only when no lane in EXEC has the bit, so
+        // lanes in EXEC without it run the v_mov too; deciding per lane would skip it: refused
+        let err = run(&[CMP, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV2, MOV3, ENDPGM]).err();
+        assert_eq!(err, Some("a branch on whether any lane of a mask is set, with lanes in EXEC without its bit"));
+        // v_cmp; s_and_saveexec s0, vcc; s_cbranch_vccz L: VCC ∧ EXEC is the new EXEC, the same
+        // as each lane's bit for every lane in it: a lane branch
+        let save: I = ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
+        let s = run(&[CMP, save, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV2, MOV3, ENDPGM]).unwrap();
+        assert_eq!((s.vector, s.guarded.len(), s.lane_branches), (2, 1, 1));
     }
 
     #[test]

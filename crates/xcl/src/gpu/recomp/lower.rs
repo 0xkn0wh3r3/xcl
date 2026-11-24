@@ -715,9 +715,6 @@ impl<'a, I: Ir> Lower<'a, I> {
                 self.write_scc(b, v);
             }
             "S_NOP" | "S_WAITCNT" | "S_WAITCNT_VSCNT" | "S_WAITCNT_VMCNT" | "S_WAITCNT_LGKMCNT" | "S_WAITCNT_EXPCNT" | "S_INST_PREFETCH" | "S_CLAUSE" => {}
-            // MODE (float rounding / denormals): only float instructions read it, and the
-            // lowering refuses every float instruction so far – revisit when floats come in
-            "S_SETREG_IMM32_B32" | "S_SETREG_B32" if self.sets_mode_only(d) => {}
             "S_SETREG_IMM32_B32" | "S_SETREG_B32" => {
                 let s = fv("SIMM16").unwrap_or(0);
                 return Err(format!("unsupported {name} hwreg {} offset {} size {}", s & 0x3F, (s >> 6) & 0x1F, ((s >> 11) & 0x1F) + 1));
@@ -868,11 +865,6 @@ impl<'a, I: Ir> Lower<'a, I> {
             }
         };
         self.write_v(b, d, vdst as u16, v)
-    }
-
-    /// `s_setreg*` writing `HW_REG_MODE` (id 1 of its `SIMM16`) and nothing else.
-    fn sets_mode_only(&self, d: &Decoded) -> bool {
-        rdna2::field_value(d.enc, &d.words, "SIMM16").unwrap_or(0) & 0x3F == 1
     }
 
     /// `s_load_dword{,x2,x4,x8,x16}`: dwords of the flat memory into SGPRs, from
@@ -3135,6 +3127,33 @@ pub(crate) mod tests {
         }
         rdna2::resolve_far_jumps(&mut out);
         out
+    }
+
+    /// A branch or a scalar select on whether any lane of a mask is set decides for the whole
+    /// wave on the console: with lanes in EXEC that lack the bit (VCC = lanes 0–15, EXEC = all),
+    /// each lane deciding by its own bit would differ in lanes 16–31, so the program is refused
+    /// (Kalmarv's five programs on #1745); where the mask is constant over EXEC it is taken.
+    #[test]
+    fn a_whole_wave_decision_on_a_mask_some_lanes_lack_is_refused() {
+        const CMP: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]);
+        const MOV7: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]);
+        const AND: I = ("S_AND_B32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 106), ("SSRC1", 126)]);
+        let programs: [(&str, Vec<I>); 5] = [
+            ("vccnz", vec![CMP, ("S_CBRANCH_VCCNZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
+            ("vccz", vec![CMP, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
+            ("and + scc1", vec![CMP, AND, ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
+            ("cmp_lg + scc1", vec![CMP, ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 106), ("SSRC1", 128)]), ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
+            ("and + cselect", vec![CMP, AND, ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 133), ("SSRC1", 135)]), ENDPGM]),
+        ];
+        for (name, p) in programs {
+            let err = lower_kernel(&decode(&p), false, Interp::default()).err().unwrap_or_else(|| panic!("{name}: taken"));
+            assert!(err.contains("any lane of a mask") || err.contains("SCC of a mask op"), "{name}: {err}");
+        }
+        // VCC = EXEC: the same in every lane in EXEC, so each lane decides as the wave does
+        let uniform: [I; 4] = [("S_MOV_B32", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 126)]), ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM];
+        let (s, v) = state(32);
+        let (_, v) = run(&uniform, false, &s, &v);
+        assert!(v.iter().all(|r| r[1] == 7));
     }
 
     /// A cross-lane scalar op on s0 holding a number takes the number path (the check for the

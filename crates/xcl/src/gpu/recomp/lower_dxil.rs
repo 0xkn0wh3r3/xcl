@@ -71,6 +71,10 @@ impl DxilIr {
             }
         }
         let mut lw = Lw::new(insts, &leaders, o, entry);
+        // the rounding modes the program sets, as `kernel::translate_on_this_thread` finds them:
+        // #1426's `s_round_mode` / `s_setreg` refuse a mode they cannot honour from these
+        let branchy = insts.iter().any(|d| crate::gpu::rdna2::branch_target(d).is_some());
+        (lw.dyn_rm, lw.has_f64_round_op) = crate::gpu::dxil::lower::round_modes(insts, !branchy);
         // a kernel's lanes in the split form: the console lane each hardware lane stands for,
         // set up in the entry block (a compute program's come with `compute_ids`)
         let mut ids = None;
@@ -430,6 +434,26 @@ mod tests {
             return false;
         }
         true
+    }
+
+    /// A rounding mode #1426's lowering cannot honour refuses the program, as #1426 and the HLSL
+    /// path do, instead of the per-lane form computing with the default mode (Kalmarv, #1745):
+    /// f32 toward zero by `s_setreg`, f64 by `s_round_mode` and by `s_setreg`.
+    #[test]
+    fn a_rounding_mode_the_lowering_cannot_honour_is_refused() {
+        let add_f32: I = ("V_ADD_F32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V), ("VSRC1", 1)]);
+        let add_f64: I = ("V_ADD_F64", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 2)]);
+        let programs: [(&str, Vec<I>); 3] = [
+            ("f32 by s_setreg", vec![("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", 0x801), ("LITERAL", 3)]), add_f32, ENDPGM]),
+            ("f64 by s_round_mode", vec![("S_ROUND_MODE", "ENC_SOPP", &[("SIMM16", 0xC)]), add_f64, ENDPGM]),
+            ("f64 by s_setreg", vec![("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", 0x881), ("LITERAL", 3)]), add_f64, ENDPGM]),
+        ];
+        for (name, p) in programs {
+            assert!(super::kernel(&decode(&p), false).is_err(), "{name}: taken");
+        }
+        // denormal bits only (MODE[7:4]): the default rounding, taken
+        let denorm: Vec<I> = vec![("S_SETREG_IMM32_B32", "ENC_SOPK", &[("SIMM16", 0x1901), ("LITERAL", 0xF)]), add_f32, ENDPGM];
+        super::kernel(&decode(&denorm), false).unwrap();
     }
 
     /// An instruction lowered by #1426 that writes to `Lw`'s entry block after the program's
