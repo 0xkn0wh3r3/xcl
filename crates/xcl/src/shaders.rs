@@ -1351,6 +1351,15 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
     let max_bytes = opt("--max-bytes").map(|v| v as usize).unwrap_or(16384);
     let timeout = std::time::Duration::from_secs(opt("--timeout").unwrap_or(10));
     let skipped = AtomicUsize::new(0);
+    // `--hash H`: only the container whose `[SHADER]` hash (FNV-64 of the container) is H, every
+    // record searched; `--dump DIR`: write each program's direct DXIL (and with `--compare` the
+    // HLSL path's source and DXIL) to DIR, for diffing the two (`dxc -dumpbin`)
+    let only_hash = args.iter().position(|a| a == "--hash").and_then(|i| args.get(i + 1)).and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+    let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
+    if let Some(d) = &dump_dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let (order, want, max_bytes) = if only_hash.is_some() { ((0..input.len()).collect(), usize::MAX, 0) } else { (order, want, max_bytes) };
     // translator panics are counted, not printed (`--trace` keeps the messages)
     if !trace {
         std::panic::set_hook(Box::new(|_| {}));
@@ -1365,6 +1374,10 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                     break;
                 }
                 let (name, Some(blob)) = input.get(ri) else { continue };
+                let blob_hash = crate::gpu::shader::fnv64(&blob);
+                if only_hash.is_some_and(|h| h != blob_hash) {
+                    continue;
+                }
                 let Some(sh) = xbox::parse(&blob) else { continue };
                 for (fi, f) in sh.fssm.iter().enumerate() {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
@@ -1392,6 +1405,16 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                             rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
                         };
                         let time = t.elapsed();
+                        let dump = |suffix: &str, bytes: &[u8]| {
+                            if let Some(d) = &dump_dir {
+                                let _ = std::fs::write(d.join(format!("{blob_hash:016x}_f{fi}_{:x}.{suffix}", p.offset)), bytes);
+                            }
+                        };
+                        dump("guest.bin", code);
+                        match &r {
+                            Ok(dxil) => dump("direct.dxil", dxil),
+                            Err(e) => dump("direct.err.txt", e.as_bytes()),
+                        }
                         let hlsl_size = (compare && r.is_ok())
                             .then(|| {
                                 let profile = match mode {
@@ -1401,7 +1424,10 @@ fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std:
                                 };
                                 let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, ..Default::default() };
                                 let t = recomp::translate(code, &opt).ok().filter(|t| t.complete())?;
-                                recomp::dxc::compile(&t.hlsl, "main", profile, &[]).ok().map(|d| d.len())
+                                dump("hlsl", t.hlsl.as_bytes());
+                                let d = recomp::dxc::compile(&t.hlsl, "main", profile, &[]).ok()?;
+                                dump("hlsl.dxil", &d);
+                                Some(d.len())
                             })
                             .flatten();
                         let sample = Sample { stage: coverage::stage_name(&mode), result: r.map(|d| d.len()), time, hlsl_size };

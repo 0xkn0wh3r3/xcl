@@ -600,7 +600,25 @@ fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bo
     let wave64 = super::detect_wave64(code);
     let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
     let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
+    dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
+}
+
+/// `XCL_DXIL_DUMP=<hash>[,<hash>…]` (`[SHADER]` hashes, or `all`): writes the direct path's
+/// DXIL to `%TEMP%\xcl-dxil-dump\<hash>.dxil` (with `XCL_TRANSLATED_CACHE=0`, so cached
+/// translations are redone).
+fn dump_direct(blob: &[u8], dxil: &[u8]) {
+    let Ok(want) = std::env::var("XCL_DXIL_DUMP") else { return };
+    let h = crate::gpu::shader::fnv64(blob);
+    if want == "all" || want.split(',').filter_map(|v| u64::from_str_radix(v.trim(), 16).ok()).any(|v| v == h) {
+        let dir = std::env::temp_dir().join("xcl-dxil-dump");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{h:016x}.dxil"));
+        match std::fs::write(&path, dxil) {
+            Ok(()) => crate::xlog_info!("[SHADER] direct DXIL of {h:016x} ({} B) written to {}", dxil.len(), path.display()),
+            Err(e) => crate::xlog_warn!("[SHADER] XCL_DXIL_DUMP {}: {e}", path.display()),
+        }
+    }
 }
 
 /// A console vertex / pixel shader through the direct DXIL translator.
@@ -617,6 +635,7 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
         (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
         _ => return Err("the shader stage does not match its slot in the PSO".into()),
     };
+    dump_direct(blob, &k.dxil);
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
 }
 
