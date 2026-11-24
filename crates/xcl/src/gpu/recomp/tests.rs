@@ -3281,7 +3281,7 @@ fn memory_windows_above_4_gib(heap: bool) {
     let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
-    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
+    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(4u + xcl_w)]"), heap);
     let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
     let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() }), hlsl_dxil());
     let hi = |a: u64| (a >> 32) as u32;
