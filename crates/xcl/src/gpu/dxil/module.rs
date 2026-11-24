@@ -893,12 +893,12 @@ impl Module {
                 w.record(FUNC_CODE_INST_GEP, &ops)
             }
             Op::AtomicRmw(op, p, v) => {
-                // [ptr, val, op, vol, ordering (seq_cst = 7), synchscope (system = 1)]
-                w.record(FUNC_CODE_INST_ATOMICRMW, &[rel(*p), rel(*v), *op as u64, 0, 7, 1])
+                // [ptr, val, op, vol, ordering, synchscope (crossthread = 1)]
+                w.record(FUNC_CODE_INST_ATOMICRMW, &[rel(*p), rel(*v), *op as u64, 0, ORDERING_SEQCST, 1])
             }
             Op::CmpXchg(p, c, n) => {
                 // [ptr, cmp, new, vol, success ordering, synchscope, failure ordering, weak]
-                w.record(FUNC_CODE_INST_CMPXCHG, &[rel(*p), rel(*c), rel(*n), 0, 7, 1, 7, 0])
+                w.record(FUNC_CODE_INST_CMPXCHG, &[rel(*p), rel(*c), rel(*n), 0, ORDERING_SEQCST, 1, ORDERING_SEQCST, 0])
             }
             Op::Br(b) => w.record(FUNC_CODE_INST_BR, &[bb(*b)]),
             Op::CondBr(c, t, f) => w.record(FUNC_CODE_INST_BR, &[bb(*t), bb(*f), rel(*c)]),
@@ -950,6 +950,11 @@ const ATTR_NODUPLICATE: u64 = 12;
 const ATTR_NOUNWIND: u64 = 18;
 const ATTR_READNONE: u64 = 20;
 const ATTR_READONLY: u64 = 21;
+
+/// `bitc::ORDERING_SEQCST`: the bitcode code, not the in-memory
+/// `AtomicOrdering::SequentiallyConsistent` (7), which LLVM's reader only
+/// accepts because it maps unknown codes to seq_cst.
+const ORDERING_SEQCST: u64 = 6;
 
 const LINKAGE_EXTERNAL: u64 = 0;
 const LINKAGE_INTERNAL: u64 = 3;

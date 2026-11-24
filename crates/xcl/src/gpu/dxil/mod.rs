@@ -23,3 +23,5 @@ pub mod validate;
 mod tests;
 #[cfg(test)]
 mod ops_tests;
+#[cfg(test)]
+mod bitreader_tests;
