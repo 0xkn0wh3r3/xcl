@@ -26,6 +26,7 @@ mod lower_mem;
 mod lower_round;
 mod lower_valu;
 mod lower_wide;
+mod lower_window;
 pub mod module;
 pub mod ops;
 pub mod ops_core;
