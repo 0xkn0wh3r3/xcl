@@ -131,11 +131,13 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
-  they cannot occupy the ordinary huge-pipeline slot. Smaller pipelines and those a game thread
-  waits for never wait. `xcl.log` shows each huge one as a numbered `driver compile start #K` /
-  `driver compile finish #K: … PSO, N B DXIL, M ms` pair (compute ones with the program hash that
-  `--measure-pso` takes), with whether it was gated and how long it waited; `XCL_PSO_TRACE=1` logs
-  every driver compile.
+  they cannot occupy the ordinary huge-pipeline slot; one of them can therefore run next to the
+  ordinary ones, and each gated compile starts only with 3 GB of commit free. Smaller pipelines
+  and those a game thread waits for never wait. `xcl.log` shows each huge one as a numbered
+  `driver compile start #K` / `driver compile finish #K: … PSO, N B DXIL, M ms` pair (compute
+  ones with `record HASH`, the console record's hash that `--measure-pso` and
+  `--export-hlsl --record-hash` take), with whether it was gated and how long it waited;
+  `XCL_PSO_TRACE=1` logs every driver compile.
 - With `XCL_DRED=1`, a D3D12 device removal logs GPU breadcrumbs in `xcl.log`.
   XCL examines up to 4,096 command lists and reports up to 64 unfinished lists, starting with
   those on which the GPU completed at least one operation.
