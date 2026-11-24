@@ -43,3 +43,5 @@ mod ops_tests;
 mod bitreader_tests;
 #[cfg(test)]
 mod robustness_tests;
+#[cfg(test)]
+mod msaa_tests;
