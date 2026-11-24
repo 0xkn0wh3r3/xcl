@@ -766,12 +766,16 @@ impl Module {
         let const_base = n_globals + n_funcs;
         let inst_base = const_base + n_consts;
 
+        // Blocks are written in reverse post-order of the entry's CFG (entry
+        // first), so a lowering may create blocks in any order; unreachable blocks
+        // are dropped. Value numbering follows that order.
+        let (order, pos) = self.block_layout();
         // Absolute value ids of instruction results.
         let mut inst_ids: Vec<Option<u64>> = vec![None; self.insts.len()];
         {
             let mut next = inst_base;
-            for b in &self.blocks {
-                for &i in b {
+            for &b in &order {
+                for &i in &self.blocks[b] {
                     if !self.is_void(self.insts[i as usize].ty) {
                         inst_ids[i as usize] = Some(next);
                         next += 1;
@@ -896,12 +900,12 @@ impl Module {
 
         // The entry's body.
         w.enter_block(BLOCK_FUNCTION);
-        w.record(FUNC_CODE_DECLAREBLOCKS, &[self.blocks.len() as u64]);
+        w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
         let mut inst_id = inst_base;
-        for b in 0..self.blocks.len() {
+        for &b in &order {
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
-                self.write_inst(&mut w, i, inst_id, &abs);
+                self.write_inst(&mut w, i, inst_id, &abs, &pos);
                 if !self.is_void(self.insts[i].ty) {
                     inst_id += 1;
                 }
@@ -952,7 +956,97 @@ impl Module {
         w.end_block();
     }
 
-    fn write_inst(&self, w: &mut BitWriter, i: usize, inst_id: u64, abs: &dyn Fn(Value) -> u64) {
+    /// Successor blocks of block `b` (from its terminator, if any).
+    fn successors(&self, b: usize) -> Vec<Block> {
+        match self.blocks[b].last().map(|&i| &self.insts[i as usize].op) {
+            Some(Op::Br(t)) => vec![*t],
+            Some(Op::CondBr(_, t, f)) => vec![*t, *f],
+            Some(Op::Switch(_, d, cases)) => std::iter::once(*d).chain(cases.iter().map(|c| c.1)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The written block order (reverse post-order from the entry block, which
+    /// keeps the creation order where that is already a valid layout) and each
+    /// block's position in it (`None`: unreachable, not written).
+    fn block_layout(&self) -> (Vec<usize>, Vec<Option<u32>>) {
+        let n = self.blocks.len();
+        let mut seen = vec![false; n];
+        let mut post = Vec::with_capacity(n);
+        // Iterative DFS; successors pushed so that earlier-created ones are visited
+        // last, which makes the reverse post-order prefer creation order.
+        let mut stack: Vec<(usize, Vec<Block>)> = vec![(0, {
+            let mut s = self.successors(0);
+            s.sort_by_key(|b| std::cmp::Reverse(b.0));
+            s
+        })];
+        seen[0] = true;
+        while let Some((b, succ)) = stack.last_mut() {
+            match succ.pop() {
+                Some(t) => {
+                    let t = t.0 as usize;
+                    if t < n && !seen[t] {
+                        seen[t] = true;
+                        let mut s = self.successors(t);
+                        s.sort_by_key(|b| std::cmp::Reverse(b.0));
+                        stack.push((t, s));
+                    }
+                }
+                None => {
+                    post.push(*b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        let mut pos = vec![None; n];
+        for (k, &b) in post.iter().enumerate() {
+            pos[b] = Some(k as u32);
+        }
+        (post, pos)
+    }
+
+    /// Replaces every use of `old` by `new` in the entry's instructions and in
+    /// metadata (e.g. to drop a trivial phi). `old` itself stays in its block.
+    pub fn replace_all_uses(&mut self, old: Value, new: Value) {
+        let r = |v: &mut Value| {
+            if *v == old {
+                *v = new;
+            }
+        };
+        for inst in &mut self.insts {
+            match &mut inst.op {
+                Op::Bin(_, a, b, _) | Op::Cmp(_, a, b) | Op::Store(a, b, _) | Op::AtomicRmw(_, a, b) => {
+                    r(a);
+                    r(b)
+                }
+                Op::Cast(_, a, _) | Op::Extract(a, _) | Op::Load(a, _) | Op::CondBr(a, _, _) | Op::Alloca(_, a, _) => r(a),
+                Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
+                    r(a);
+                    r(b);
+                    r(c)
+                }
+                Op::Call(_, args) => args.iter_mut().for_each(r),
+                Op::Phi(inc) => inc.iter_mut().for_each(|(v, _)| r(v)),
+                Op::Gep(p, idx) => {
+                    r(p);
+                    idx.iter_mut().for_each(r)
+                }
+                Op::Switch(v, _, cases) => {
+                    r(v);
+                    cases.iter_mut().for_each(|(c, _)| r(c))
+                }
+                Op::Br(_) | Op::Ret | Op::Unreachable => {}
+            }
+        }
+        for m in &mut self.md {
+            if let MdDef::Val(_, v) = m {
+                r(v);
+            }
+        }
+    }
+
+    fn write_inst(&self, w: &mut BitWriter, i: usize, inst_id: u64, abs: &dyn Fn(Value) -> u64, pos: &[Option<u32>]) {
         // Relative operand; forward references are only legal in phis.
         let rel = |v: Value| -> u64 {
             let a = abs(v);
@@ -962,7 +1056,13 @@ impl Module {
             }
             inst_id - a
         };
-        let bb = |b: Block| b.0 as u64;
+        let bb = |b: Block| match pos.get(b.0 as usize).copied().flatten() {
+            Some(p) => p as u64,
+            None => {
+                self.fail(format!("branch to missing block {}", b.0));
+                0
+            }
+        };
         match &self.insts[i].op {
             Op::Bin(op, a, b, flags) => {
                 let mut ops = vec![rel(*a), rel(*b), *op as u64];
@@ -983,7 +1083,8 @@ impl Module {
             }
             Op::Phi(inc) => {
                 let mut ops = vec![self.insts[i].ty.0 as u64];
-                for &(v, b) in inc {
+                // incoming edges from unreachable (unwritten) blocks are dropped
+                for &(v, b) in inc.iter().filter(|(_, b)| pos.get(b.0 as usize).copied().flatten().is_some()) {
                     ops.push(signed(inst_id as i64 - abs(v) as i64));
                     ops.push(bb(b));
                 }
