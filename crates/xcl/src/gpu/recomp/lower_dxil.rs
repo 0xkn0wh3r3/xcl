@@ -541,6 +541,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_branch_on_a_mixed_mask_matches_the_hlsl_path_on_the_gpu() {
+        if !gpu() { return; }
+        if dxc::location().is_err() {
+            runner::skip_test("no DXC");
+            return;
+        }
+        // Only the low 16 bits of VCC are set. AND with the user SGPR still
+        // leaves a nonzero word, so the scalar move runs for the entire wave.
+        let lines: &[I] = &[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 106), ("SSRC1", 8)]),
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)]),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 6), ("SSRC0", 129)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 6)]),
+            ENDPGM,
+        ];
+        let bytes: Vec<u8> = lines.iter().flat_map(encode_line).collect();
+        let mut state = runner::KernelState::default();
+        state.sgpr[8] = u32::MAX;
+        state.sgpr[126] = u32::MAX;
+        for lane in 0..32 {
+            state.vgpr[lane][0] = lane as u32;
+        }
+        let tr = translate(&bytes, &Options { wave64: false, ..Default::default() }).unwrap();
+        assert!(tr.complete(), "{:?}", tr.unsupported_why);
+        let hlsl = dxc::compile(&tr.hlsl, "main", "cs_6_6", &[]).unwrap();
+        let reference = runner::run(&hlsl, &state, &[]).unwrap();
+        assert!(reference.vgpr[..32].iter().all(|v| v[1] == 1));
+        match super::kernel(&decode(lines), false) {
+            Err(e) => assert!(e.contains("any lane of a mask"), "{e}"),
+            Ok((dxil, _)) => {
+                let actual = runner::run(&dxil, &state, &[]).unwrap();
+                for lane in 0..32 {
+                    assert_eq!(actual.vgpr[lane][1], reference.vgpr[lane][1], "lane {lane}");
+                }
+            }
+        }
+    }
+
     /// The integer programs of `lower`'s tests, as `f32_programs_on_the_gpu`.
     #[test]
     fn integer_programs_on_the_gpu() {
