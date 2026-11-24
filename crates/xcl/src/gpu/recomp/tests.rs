@@ -7775,3 +7775,49 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+#[test]
+fn gpu_bvh_triangle_types_2_and_3() {
+    if !gpu_ready() {
+        return;
+    }
+    let base = 0x1000usize;
+    let mut mem = vec![0u32; 0x2000 / 4];
+    let w = |mem: &mut Vec<u32>, at: usize, vals: &[u32]| mem[(base + at) / 4..(base + at) / 4 + vals.len()].copy_from_slice(vals);
+    let ff = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+    // 5 vertices at byte 0x100: v0=(0,0,1), v1=(2,0,1), v2=(1,2,1), v3=(3,2,2), v4=(1,4,3)
+    w(&mut mem, 0x100, &ff(&[0.0, 0.0, 1.0, 2.0, 0.0, 1.0, 1.0, 2.0, 1.0, 3.0, 2.0, 2.0, 1.0, 4.0, 3.0]));
+    w(&mut mem, 0x100 + 60, &[0x0909_0909]);
+    let node_base = 0x100u32 >> 3;
+    let (node2, node3) = (node_base | 2, node_base | 3);
+
+    let mimg = |n: &'static str, vdata: u64, vaddr: u64| encode(n, "ENC_MIMG", &[("VDATA", vdata), ("VADDR", vaddr), ("SRSRC", 2), ("DMASK", 15)], None).unwrap();
+    let mut code = Vec::new();
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 100, 0));  // type 2 hit
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 104, 20)); // type 3 hit
+    code.extend(mimg("IMAGE_BVH_INTERSECT_RAY", 108, 40)); // type 2 miss at type 0's center
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+
+    let mut st = KernelState::default();
+    st.sgpr[8..12].copy_from_slice(&[(base >> 8) as u32, 0, u32::MAX, 0]);
+    let set_ray = |r: &mut Vec<u32>, at: usize, node: u32, ox: f32, oy: f32| {
+        r[at] = node;
+        let v = [100.0f32, ox, oy, 0.0, 0.0, 0.0, 1.0, f32::INFINITY, f32::INFINITY, 1.0];
+        for (k, x) in v.iter().enumerate() {
+            r[at + 1 + k] = x.to_bits();
+        }
+    };
+    for r in st.vgpr.iter_mut() {
+        set_ray(r, 0, node2, 5.0 / 3.0, 8.0 / 3.0);
+        set_ray(r, 20, node3, 2.0 / 3.0, 2.0);
+        set_ray(r, 40, node2, 1.0, 0.5);
+    }
+    let res = runner::run_code(&code, &st, &mem).unwrap();
+    let v = &res.vgpr[0];
+    let hit2 = [v[100], v[101], v[102], v[103]].map(f32::from_bits);
+    let hit3 = [v[104], v[105], v[106], v[107]].map(f32::from_bits);
+    let miss2 = [v[108], v[109], v[110], v[111]].map(f32::from_bits);
+    assert!(hit2[0].is_finite() && (hit2[0] / hit2[1] - 2.0).abs() < 1e-4, "gpu type 2 hit: {hit2:?}");
+    assert!(hit3[0].is_finite() && (hit3[0] / hit3[1] - 5.0 / 3.0).abs() < 1e-4, "gpu type 3 hit: {hit3:?}");
+    assert!(miss2[0].is_infinite(), "gpu type 2 must miss type 0's interior: {miss2:?}");
+}
