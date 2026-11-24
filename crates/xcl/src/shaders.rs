@@ -680,7 +680,29 @@ fn coverage(agg: &Agg, order: &[String], ks: &[usize]) -> Vec<(usize, usize)> {
 
 pub fn run(path: &Path, args: &[String]) -> i32 {
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<usize>().ok());
-    let value = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
+    // a flag that needs a value: missing, or another flag in its place, is an error
+    let required = |name: &str| -> Result<Option<&String>, String> {
+        match args.iter().position(|a| a == name) {
+            None => Ok(None),
+            Some(i) => match args.get(i + 1) {
+                Some(v) if !v.starts_with("--") => Ok(Some(v)),
+                _ => Err(format!("xcl shaders: {name} needs a value")),
+            },
+        }
+    };
+    let (export_dir, record_hash, measure) = match (required("--export-hlsl"), required("--record-hash"), required("--measure-pso")) {
+        (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    // the runtime's memory windows: from the descriptor heap with `XCL_HEAP_WINDOWS=1`
+    // (`pso::mem_windows`), as `--precompile`
+    let runtime_windows = || {
+        let windows = opt("--windows").unwrap_or(4) as u32;
+        if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows }
+    };
     let top = opt("--top").unwrap_or(60);
     let json = args.iter().any(|a| a == "--json");
     let compile = opt("--compile").unwrap_or(0);
@@ -708,14 +730,17 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
+        } else if export_dir.is_some() || measure.is_some() {
+            // one shader file: the record to export or measure
+            (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
             let mut a = Agg { recomp_on, keep: compile, iface_on, ..Default::default() };
             a.add(&path.display().to_string(), &data);
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
-    if let Some(dir) = value("--export-hlsl") {
-        let record_hash = match value("--record-hash").map(|v| parse_record_hash(v)) {
+    if let Some(dir) = export_dir {
+        let record_hash = match record_hash.map(|v| parse_record_hash(v)) {
             Some(Ok(h)) => Some(h),
             Some(Err(e)) => {
                 eprintln!("xcl shaders: --record-hash: {e}");
@@ -728,12 +753,12 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             Path::new(dir),
             opt("--min-kb").unwrap_or(1024),
             opt("--count").unwrap_or(2),
-            opt("--windows").unwrap_or(4) as u32,
+            runtime_windows(),
             opt("--split").map(|v| v != 0),
             record_hash,
         );
     }
-    if let Some(hash) = value("--measure-pso") {
+    if let Some(hash) = measure {
         let hash = match parse_record_hash(hash) {
             Ok(h) => h,
             Err(e) => {
@@ -745,7 +770,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             &input,
             hash,
             opt("--repeat").unwrap_or(1).max(1),
-            opt("--windows").unwrap_or(4) as u32,
+            runtime_windows(),
             opt("--split").map(|v| v != 0),
         );
     }
@@ -753,8 +778,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
         let pipelines = args.iter().any(|a| a == "--pipelines");
         // the runtime's key: heap windows with `XCL_HEAP_WINDOWS=1` (`pso::mem_windows`)
-        let windows = opt("--windows").unwrap_or(4) as u32;
-        let windows = if windows > 1 && recomp::pso::heap_windows() { windows | recomp::HEAP_WINDOWS } else { windows };
+        let windows = runtime_windows();
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), windows, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
     if args.iter().any(|a| a == "--direct") {
@@ -826,17 +850,24 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
         if exported.contains(&hash) {
             continue;
         }
-        matched = true;
         if !is_compute_container(&blob) {
-            failures += 1;
-            eprintln!("  {name} ({hash:016x}): not a console compute shader");
+            if record_hash.is_some() {
+                matched = true;
+                failures += 1;
+                eprintln!("  {name} ({hash:016x}): not a console compute shader");
+                break;
+            }
             continue;
         }
+        matched = true;
         let hlsl = match recomp::pso::console_hlsl(&blob, recomp::pso::Stage::Compute, windows, split) {
             Ok((hlsl, _)) => hlsl,
             Err(e) => {
                 failures += 1;
                 eprintln!("  {name} ({hash:016x}): {e}");
+                if record_hash.is_some() {
+                    break;
+                }
                 continue;
             }
         };
@@ -847,6 +878,9 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
         if let Err(e) = std::fs::write(dir.join(&file), &hlsl) {
             failures += 1;
             eprintln!("  {name} ({hash:016x}): cannot write {file}: {e}");
+            if record_hash.is_some() {
+                break;
+            }
             continue;
         }
         println!("{:>8} KB  {file} {name}", hlsl.len() / 1024);
@@ -856,80 +890,70 @@ fn export_hlsl(input: &Input, dir: &Path, min_kb: usize, count: usize, windows: 
     if record_hash.is_some() && !matched {
         eprintln!("  record {:016x} not found", record_hash.unwrap());
     }
-    println!("{written} program(s) written to {} (split wave64: {split}, {windows} windows, {failures} failure(s))", dir.display());
+    println!(
+        "{written} program(s) written to {} (split wave64: {split}, {} windows{}, {failures} failure(s))",
+        dir.display(),
+        windows & !recomp::HEAP_WINDOWS,
+        if windows & recomp::HEAP_WINDOWS != 0 { " from the descriptor heap" } else { "" }
+    );
     if written == wanted { 0 } else {
         eprintln!("xcl shaders --export-hlsl: requested {wanted} program(s), wrote {written}");
         2
     }
 }
 
+/// Why `measure_pso` did not measure: this machine cannot (no device, no cache control,
+/// no DXC), or the record or the driver failed.
+#[derive(Debug)]
+enum MeasureError {
+    Unavailable(String),
+    Failed(String),
+}
+
 /// Compile one exact console compute shader through DXC, then time only the driver's
 /// `CreateComputePipelineState`. The implicit D3D and driver caches must both be disabled;
 /// refusing to do that is an error rather than a misleading warm-cache measurement.
+/// This is the HLSL path the runtime uses by default (not `XCL_DIRECT_DXIL`).
 fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>) -> i32 {
+    match measure_pso_result(input, hash, repeat, windows, split) {
+        Ok(()) => 0,
+        Err(MeasureError::Unavailable(e) | MeasureError::Failed(e)) => {
+            eprintln!("xcl shaders --measure-pso: {e}");
+            2
+        }
+    }
+}
+
+fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, split: Option<bool>) -> Result<(), MeasureError> {
     use windows::core::Interface;
     use windows::Win32::Graphics::Direct3D12::*;
+    use MeasureError::{Failed, Unavailable};
 
-    let (name, blob) = match record_by_hash(input, hash) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("xcl shaders --measure-pso: {e}");
-            return 2;
-        }
-    };
+    let (name, blob) = record_by_hash(input, hash).map_err(Failed)?;
     if !is_compute_container(&blob) {
-        eprintln!("xcl shaders --measure-pso: {name} is not a console compute shader");
-        return 2;
+        return Err(Failed(format!("{name} is not a console compute shader")));
     }
-    let pipeline = match Pipelines::new() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("xcl shaders --measure-pso: no GPU device: {e}");
-            return 2;
-        }
-    };
-    let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::pso::wave32_only_for_device(&pipeline.dev));
-    let (translation, profile) = match recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("xcl shaders --measure-pso: {name}: {e}");
-            return 2;
-        }
-    };
-    let dxc_start = std::time::Instant::now();
-    let dxil = match recomp::dxc::compile(&translation.hlsl, "main", profile, &[]) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("xcl shaders --measure-pso: DXC: {e}");
-            return 2;
-        }
-    };
-    let dxc_ms = dxc_start.elapsed().as_millis();
-    let dev9 = match pipeline.dev.cast::<ID3D12Device9>() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("xcl shaders --measure-pso: ID3D12Device9 is required to disable the driver cache: {e}");
-            return 2;
-        }
-    };
+    recomp::dxc::location().map_err(|e| Unavailable(format!("DXC: {e}")))?;
+    let pipeline = Pipelines::new().map_err(|e| Unavailable(format!("no GPU device: {e}")))?;
+    // before translating and compiling (tens of seconds for a big program): a machine that
+    // cannot turn the caches off fails at once
+    let dev9 = pipeline.dev.cast::<ID3D12Device9>().map_err(|e| Unavailable(format!("ID3D12Device9 is required to disable the driver cache: {e}")))?;
     let cache_kinds = D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER;
-    if let Err(e) = unsafe { dev9.ShaderCacheControl(cache_kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) } {
-        eprintln!("xcl shaders --measure-pso: cannot disable the driver cache: {e}");
-        return 2;
-    }
-    let rs = match recomp::pso::abi_root_signature_with(&pipeline.dev, true, &translation.static_samplers) {
-        Ok(rs) => rs,
-        Err(e) => {
-            eprintln!("xcl shaders --measure-pso: root signature: {e}");
-            return 2;
-        }
-    };
-    let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+    unsafe { dev9.ShaderCacheControl(cache_kinds, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE) }
+        .map_err(|e| Unavailable(format!("cannot disable the driver cache (Windows Developer Mode is required): {e}")))?;
+    let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::pso::wave32_only_for_device(&pipeline.dev));
+    let (translation, profile) = recomp::pso::console_translation(&blob, recomp::pso::Stage::Compute, 0, windows, split).map_err(|e| Failed(format!("{name}: {e}")))?;
+    let dxc_start = std::time::Instant::now();
+    let dxil = recomp::dxc::compile(&translation.hlsl, "main", profile, &[]).map_err(|e| Failed(format!("DXC: {e}")))?;
+    let dxc_ms = dxc_start.elapsed().as_millis();
+    let rs = recomp::pso::abi_root_signature_with(&pipeline.dev, true, &translation.static_samplers).map_err(|e| Failed(format!("root signature: {e}")))?;
+    let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
         CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
         ..Default::default()
     };
     let mut times = Vec::with_capacity(repeat);
+    let mut failure = None;
     for run in 1..=repeat {
         let start = std::time::Instant::now();
         let result = unsafe { pipeline.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
@@ -937,12 +961,17 @@ fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Opt
         match result {
             Ok(pso) => drop(pso),
             Err(e) => {
-                eprintln!("xcl shaders --measure-pso: CreateComputePipelineState run {run}: {e}");
-                return 2;
+                failure = Some(Failed(format!("CreateComputePipelineState run {run}: {e}")));
+                break;
             }
         }
         println!("PSO run {run}/{repeat}: {:.3} s", elapsed.as_secs_f64());
         times.push(elapsed.as_secs_f64());
+    }
+    // the root signature's reference, on every path
+    drop(unsafe { std::mem::ManuallyDrop::take(&mut desc.pRootSignature) });
+    if let Some(e) = failure {
+        return Err(e);
     }
     times.sort_by(f64::total_cmp);
     let median = if times.len() & 1 == 0 { (times[times.len() / 2 - 1] + times[times.len() / 2]) / 2.0 } else { times[times.len() / 2] };
@@ -953,7 +982,7 @@ fn measure_pso(input: &Input, hash: u64, repeat: usize, windows: u32, split: Opt
         times[0],
         times[times.len() - 1]
     );
-    0
+    Ok(())
 }
 
 /// `--precompile`: translate every VS / PS / MS / CS program and compile it into the DXIL cache
@@ -1544,6 +1573,33 @@ mod tests {
         assert_eq!(export_hlsl(&input, &short, 0, 3, 4, Some(false), None), 2);
         let missing = root.0.join("missing");
         assert_eq!(export_hlsl(&input, &missing, 0, 1, 4, Some(false), Some(u64::MAX)), 2);
+
+        // a non-compute record is skipped silently, unless it is the one asked for
+        let other_path = root.0.join("other.bin");
+        let other = b"not a console shader".to_vec();
+        std::fs::write(&other_path, &other).unwrap();
+        let mixed = Input::Files(vec![other_path.clone(), root.0.join("first.bin")]);
+        assert_eq!(export_hlsl(&mixed, &root.0.join("mixed"), 0, 1, 4, Some(false), None), 0);
+        assert_eq!(export_hlsl(&mixed, &root.0.join("other"), 0, 1, 4, Some(false), Some(shader::fnv64(&other))), 2);
+
+        // through the command line: one shader file is an input of its own
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let single = root.0.join("single");
+        let hex = format!("{first_hash:016x}");
+        assert_eq!(run(&root.0.join("first.bin"), &args(&["--export-hlsl", single.to_str().unwrap(), "--record-hash", &hex, "--split", "0"])), 0);
+        assert!(single.join(format!("{hex}.hlsl")).is_file());
+    }
+
+    #[test]
+    fn a_flag_without_its_value_is_an_error() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let dir = std::env::temp_dir().join(format!("xcl-flag-value-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        assert_eq!(run(&dir, &args(&["--export-hlsl", "--record-hash", "DEADBEEF"])), 2);
+        assert!(!std::path::Path::new("--record-hash").exists(), "the next flag is not taken as the value");
+        assert_eq!(run(&dir, &args(&["--measure-pso"])), 2);
+        assert_eq!(run(&dir, &args(&["--export-hlsl", "out", "--record-hash"])), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1562,7 +1618,12 @@ mod tests {
         let blob = compute_sample();
         std::fs::write(&path.0, &blob).unwrap();
         let hash = shader::fnv64(&blob);
-        assert_eq!(measure_pso(&Input::Files(vec![path.0.clone()]), hash, 1, 4, None), 0);
+        match measure_pso_result(&Input::Files(vec![path.0.clone()]), hash, 1, 4, None) {
+            Ok(()) => {}
+            // no DXC, a WARP-only or cacheless device, cache control without Developer Mode
+            Err(MeasureError::Unavailable(e)) => recomp::runner::skip_test(&e),
+            Err(MeasureError::Failed(e)) => panic!("{e}"),
+        }
     }
 
     #[test]
