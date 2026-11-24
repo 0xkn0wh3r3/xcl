@@ -92,3 +92,142 @@ fn translation_is_byte_identical_across_runs_and_threads() {
         assert!(t.join().unwrap() == first, "a translation on another thread differs");
     }
 }
+
+// ---- builder misuse: recorded as the first error, finish fails instead of panicking
+
+use super::container::Stage;
+use super::module::{BinOp, FnAttrs, Module};
+use super::shader::Shader;
+
+/// A compute shader with `misuse` applied fails to finish with an error containing `want`.
+fn finish_fails(want: &str, misuse: impl FnOnce(&mut Shader)) {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    misuse(&mut s);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.try_finish([1, 1, 1], None)));
+    let e = r.expect("try_finish panicked").expect_err("misuse was not reported");
+    assert!(e.contains(want), "error {e:?} does not name {want:?}");
+}
+
+#[test]
+fn forward_reference_outside_a_phi_is_an_error() {
+    finish_fails("forward reference", |s| {
+        let later = s.m.new_block();
+        let entry = s.m.current_block();
+        s.m.set_block(later);
+        let one = s.m.i32c(1);
+        let two = s.m.i32c(2);
+        let v = s.m.bin(BinOp::Add, one, two);
+        s.m.ret();
+        s.m.set_block(entry);
+        let _ = s.m.bin(BinOp::Add, v, one);
+        s.m.br(later);
+    });
+}
+
+#[test]
+fn instruction_after_a_terminator_is_an_error() {
+    finish_fails("after a terminator", |s| {
+        s.m.ret();
+        let one = s.m.i32c(1);
+        let _ = s.m.bin(BinOp::Add, one, one);
+    });
+}
+
+#[test]
+fn unknown_overload_suffix_is_an_error() {
+    finish_fails("overload suffix", |s| {
+        let i32 = s.m.i32();
+        let arr = s.m.array(4, i32);
+        let _ = s.type_suffix(arr);
+    });
+}
+
+#[test]
+fn gep_and_extractvalue_into_wrong_types_are_errors() {
+    finish_fails("gep into", |s| {
+        let i32 = s.m.i32();
+        let g = s.m.global("g", i32, 3, None, false, 4);
+        let z = s.m.i32c(0);
+        let _ = s.m.gep(g, &[z, z]);
+    });
+    finish_fails("gep: struct field", |s| {
+        let i32 = s.m.i32();
+        let st = s.m.named_struct("S", &[i32]);
+        let g = s.m.global("g", st, 3, None, false, 4);
+        let z = s.m.i32c(0);
+        let k = s.m.i32c(5);
+        let _ = s.m.gep_fields(g, &[z, k]);
+    });
+    finish_fails("not a pointer", |s| {
+        let one = s.m.i32c(1);
+        let _ = s.m.load(one, 4);
+    });
+    finish_fails("extractvalue", |s| {
+        let one = s.m.i32c(1);
+        let _ = s.m.extract(one, 0);
+    });
+}
+
+#[test]
+fn redeclared_function_and_bad_calls_are_errors() {
+    finish_fails("redeclared", |s| {
+        let v = s.m.void();
+        let i32 = s.m.i32();
+        let a = s.m.func_ty(v, &[]);
+        let b = s.m.func_ty(v, &[i32]);
+        s.m.declare("f", a, FnAttrs::None);
+        s.m.declare("f", b, FnAttrs::None);
+    });
+    finish_fails("arguments", |s| {
+        let v = s.m.void();
+        let t = s.m.func_ty(v, &[]);
+        let f = s.m.declare("f", t, FnAttrs::None);
+        let one = s.m.i32c(1);
+        s.m.call(f, &[one]);
+    });
+    finish_fails("second defined function", |s| {
+        s.m.define_entry("other");
+    });
+}
+
+#[test]
+fn bad_constants_phis_and_stores_are_errors() {
+    finish_fails("const_int", |s| {
+        let f = s.m.f32();
+        s.m.const_int(f, 1);
+    });
+    finish_fails("const_float", |s| {
+        let i = s.m.i32();
+        s.m.const_float(i, 1);
+    });
+    finish_fails("non-phi", |s| {
+        let one = s.m.i32c(1);
+        let v = s.m.bin(BinOp::Add, one, one);
+        let b = s.m.current_block();
+        s.m.add_incoming(v, one, b);
+    });
+    finish_fails("rawBufferStore of 5", |s| {
+        let u = s.raw_uav(0, 0);
+        let z = s.m.i32c(0);
+        s.raw_store(u, z, &[z; 5]);
+    });
+}
+
+#[test]
+fn use_of_a_void_value_and_wrong_finish_are_errors() {
+    finish_fails("void instruction", |s| {
+        let u = s.raw_uav(0, 0);
+        let z = s.m.i32c(0);
+        s.raw_store(u, z, &[z]);
+        // the store's (void) result as an operand
+        let st = super::module::Value::Inst(s.m.block_insts(s.m.current_block()).last().copied().unwrap());
+        let i32 = s.m.i32();
+        let _ = s.m.cast(super::module::CastOp::BitCast, st, i32);
+    });
+    let s = Shader::new(Stage::Pixel, (6, 6));
+    assert!(s.try_finish([1, 1, 1], None).is_err());
+    let mut m = Module::new();
+    m.ret();
+    m.ret();
+    assert!(m.try_to_bitcode("dxil-ms-dx", "").is_err());
+}

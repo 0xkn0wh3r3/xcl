@@ -198,7 +198,8 @@ impl Shader {
         } else if t == self.m.i8() {
             "i8"
         } else {
-            panic!("no dx.op overload suffix for type {t:?}")
+            self.m.fail(format!("no dx.op overload suffix for type {t:?}"));
+            "i32"
         }
     }
 
@@ -306,7 +307,9 @@ impl Shader {
 
     /// `rawBufferStore` of up to four 32-bit values at byte `offset`.
     pub fn raw_store(&mut self, buf: RawUav, offset: Value, vals: &[Value]) {
-        assert!((1..=4).contains(&vals.len()));
+        if !(1..=4).contains(&vals.len()) {
+            return self.m.fail(format!("rawBufferStore of {} values", vals.len()));
+        }
         let i32 = self.m.i32();
         let void = self.m.void();
         let undef = self.m.undef(i32);
@@ -454,9 +457,17 @@ impl Shader {
         }
     }
 
-    /// Writes metadata, bitcode and the signed container.
-    pub fn finish(mut self, numthreads: [u32; 3], wave_size: Option<u32>) -> Vec<u8> {
-        assert_eq!(self.stage, Stage::Compute, "only compute entry points are finished so far");
+    /// Writes metadata, bitcode and the signed container (panics on a builder error: tests;
+    /// translators use [`Shader::try_finish`]).
+    pub fn finish(self, numthreads: [u32; 3], wave_size: Option<u32>) -> Vec<u8> {
+        self.try_finish(numthreads, wave_size).unwrap_or_else(|e| panic!("DXIL builder: {e}"))
+    }
+
+    /// [`Shader::finish`], or the first builder error.
+    pub fn try_finish(mut self, numthreads: [u32; 3], wave_size: Option<u32>) -> Result<Vec<u8>, String> {
+        if self.stage != Stage::Compute {
+            return Err(format!("finish of a {:?} entry (only compute; graphics use finish_graphics)", self.stage));
+        }
         if !self.m.terminated() {
             self.m.ret();
         }
@@ -508,9 +519,9 @@ impl Shader {
         }
         m.named_md("dx.entryPoints", &[entry]);
 
-        let bitcode = m.to_bitcode(TRIPLE, DATALAYOUT);
+        let bitcode = m.try_to_bitcode(TRIPLE, DATALAYOUT)?;
         let (min_wave, max_wave) = wave_size.map_or((0, u32::MAX), |w| (w, w));
         let psv = Psv { stage: self.stage, min_wave, max_wave, numthreads, resources: psv_res, entry: "main".into() };
-        container::container(self.stage, self.sm, &bitcode, sfi0, &psv)
+        Ok(container::container(self.stage, self.sm, &bitcode, sfi0, &psv))
     }
 }
