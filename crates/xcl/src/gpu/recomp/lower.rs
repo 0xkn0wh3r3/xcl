@@ -3145,7 +3145,11 @@ pub(crate) mod tests {
         const CMP: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]);
         const MOV7: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 135)]);
         const AND: I = ("S_AND_B32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 106), ("SSRC1", 126)]);
-        let programs: [(&str, Vec<I>); 5] = [
+        let mixed: I = ("S_AND_B32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 106), ("SSRC1", 8)]);
+        let programs: [(&str, Vec<I>); 8] = [
+            ("mask and number + scc0", vec![CMP, mixed, ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
+            ("mask and number + select", vec![CMP, mixed, ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 133), ("SSRC1", 135)]), ENDPGM]),
+            ("mask compared with number", vec![CMP, ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 106), ("SSRC1", 8)]), ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
             ("vccnz", vec![CMP, ("S_CBRANCH_VCCNZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
             ("vccz", vec![CMP, ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
             ("and + scc1", vec![CMP, AND, ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM]),
