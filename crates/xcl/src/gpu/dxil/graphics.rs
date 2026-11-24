@@ -1065,4 +1065,4 @@ impl Shader {
 
 #[cfg(test)]
 #[path = "graphics_tests.rs"]
-mod tests;
+pub(in crate::gpu::dxil) mod tests;

@@ -1,5 +1,5 @@
 //! Graphics-stage checks: container parts byte for byte against DXC 1.9
-//! output for the HLSL programs in `testdata/dxc_{vs,ps,ms}_*.hlsl`, the
+//! output for the HLSL programs in `tests/data/dxil/dxc_{vs,ps,ms}_*.hlsl`, the
 //! validator on every emitted shader, and draws on the GPU.
 
 use super::*;
@@ -39,7 +39,7 @@ pub(super) fn assert_valid(c: &[u8]) {
     }
 }
 
-/// `testdata/dxc_vs_basic.hlsl`.
+/// `tests/data/dxil/dxc_vs_basic.hlsl`.
 fn vs_basic() -> Vec<u8> {
     let mut s = Shader::new(Stage::Vertex, (6, 6));
     let mut io = GraphicsIo::new(Stage::Vertex);
@@ -67,7 +67,7 @@ fn vs_basic() -> Vec<u8> {
     s.finish_graphics(io, StageInfo::Vertex)
 }
 
-/// `testdata/dxc_ps_basic.hlsl`.
+/// `tests/data/dxil/dxc_ps_basic.hlsl`.
 fn ps_basic() -> Vec<u8> {
     let mut s = Shader::new(Stage::Pixel, (6, 6));
     let mut io = GraphicsIo::new(Stage::Pixel);
@@ -94,8 +94,8 @@ impl From<BinOpF> for crate::gpu::dxil::module::BinOp {
     }
 }
 
-const DXC_VS_BASIC: &[u8] = include_bytes!("testdata/dxc_vs_basic.dxil");
-const DXC_PS_BASIC: &[u8] = include_bytes!("testdata/dxc_ps_basic.dxil");
+const DXC_VS_BASIC: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_vs_basic.dxil");
+const DXC_PS_BASIC: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ps_basic.dxil");
 
 #[test]
 fn vs_basic_parts_match_dxc() {
@@ -122,7 +122,7 @@ fn f(s: &mut Shader, v: f32) -> Value {
     s.m.f32c(v.to_bits())
 }
 
-/// `testdata/dxc_ps_modes.hlsl`: interpolation modes, system values,
+/// `tests/data/dxil/dxc_ps_modes.hlsl`: interpolation modes, system values,
 /// discard, coverage, two targets and depth.
 fn ps_modes() -> Vec<u8> {
     let mut s = Shader::new(Stage::Pixel, (6, 6));
@@ -176,7 +176,7 @@ fn ps_modes() -> Vec<u8> {
     s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false })
 }
 
-/// `testdata/dxc_ps_packing.hlsl`: row sharing between user semantics and
+/// `tests/data/dxil/dxc_ps_packing.hlsl`: row sharing between user semantics and
 /// system values, mixed types, unpacked `SV_SampleIndex`, unused inputs.
 fn ps_packing() -> Vec<u8> {
     let mut s = Shader::new(Stage::Pixel, (6, 6));
@@ -205,7 +205,7 @@ fn ps_packing() -> Vec<u8> {
     s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false })
 }
 
-/// `testdata/dxc_vs_packing.hlsl`: output packing with system values,
+/// `tests/data/dxil/dxc_vs_packing.hlsl`: output packing with system values,
 /// a two-row matrix, `SV_RenderTargetArrayIndex`, `SV_InstanceID`.
 fn vs_packing() -> Vec<u8> {
     let mut s = Shader::new(Stage::Vertex, (6, 6));
@@ -258,7 +258,7 @@ fn vs_packing() -> Vec<u8> {
     s.finish_graphics(io, StageInfo::Vertex)
 }
 
-/// `testdata/dxc_ms_basic.hlsl`: vertex and primitive outputs.
+/// `tests/data/dxil/dxc_ms_basic.hlsl`: vertex and primitive outputs.
 fn ms_basic() -> Vec<u8> {
     let mut s = Shader::new(Stage::Mesh, (6, 6));
     let mut io = GraphicsIo::new(Stage::Mesh);
@@ -301,10 +301,10 @@ fn ms_basic() -> Vec<u8> {
     s.finish_graphics(io, info)
 }
 
-const DXC_PS_MODES: &[u8] = include_bytes!("testdata/dxc_ps_modes.dxil");
-const DXC_PS_PACKING: &[u8] = include_bytes!("testdata/dxc_ps_packing.dxil");
-const DXC_VS_PACKING: &[u8] = include_bytes!("testdata/dxc_vs_packing.dxil");
-const DXC_MS_BASIC: &[u8] = include_bytes!("testdata/dxc_ms_basic.dxil");
+const DXC_PS_MODES: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ps_modes.dxil");
+const DXC_PS_PACKING: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ps_packing.dxil");
+const DXC_VS_PACKING: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_vs_packing.dxil");
+const DXC_MS_BASIC: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ms_basic.dxil");
 
 #[test]
 fn ps_modes_parts_match_dxc() {
@@ -409,10 +409,32 @@ fn expect_triangle(px: &[[f32; 4]], inside: [f32; 4]) {
     }
 }
 
+/// Whether the runner's VS/PS draw path can run here. It is exercised upstream only where
+/// wave64 programs run (`recomp::tests::gpu_ready`); on an adapter with neither 32- nor
+/// 64-lane waves (WARP / the Basic Render Driver on CI) even a DXC-compiled VS/PS draw
+/// removes the device, which would then fail every later GPU test in the process.
+pub(in crate::gpu::dxil) fn draw_ready() -> bool {
+    use crate::gpu::recomp::runner;
+    match runner::wave64_programs_supported() {
+        Ok(true) => true,
+        Ok(false) => {
+            runner::skip_test("no wave64");
+            false
+        }
+        Err(_) => {
+            runner::skip_test("no GPU");
+            false
+        }
+    }
+}
+
 #[test]
 fn emitted_vs_ps_draw_a_triangle() {
     use crate::gpu::recomp::runner;
     use windows::Win32::Graphics::Dxgi::Common::*;
+    if !draw_ready() {
+        return;
+    }
     let (vs, ps) = (draw_vs(), draw_ps());
     assert_valid(&vs);
     assert_valid(&ps);
@@ -491,7 +513,7 @@ fn emitted_ms_ps_draw_a_triangle() {
     expect_triangle(&px, [COLOR[0] * MEM[0], COLOR[1] * MEM[1], COLOR[2] * MEM[2], 5.0 + MEM[3]]);
 }
 
-/// `testdata/dxc_ms_payload.hlsl`: payload, groupshared memory, line
+/// `tests/data/dxil/dxc_ms_payload.hlsl`: payload, groupshared memory, line
 /// topology, `SV_CullPrimitive` (unpacked bool), `SV_RenderTargetArrayIndex`
 /// sharing a primitive row.
 fn ms_payload() -> Vec<u8> {
@@ -550,7 +572,7 @@ fn ms_payload() -> Vec<u8> {
     s.finish_graphics(io, info)
 }
 
-/// `testdata/dxc_ps_outputs.hlsl`: `SV_Target2`, coverage / depth-GE /
+/// `tests/data/dxil/dxc_ps_outputs.hlsl`: `SV_Target2`, coverage / depth-GE /
 /// stencil outputs, centroid position, a primitive attribute and the render
 /// target index as inputs.
 fn ps_outputs() -> Vec<u8> {
@@ -583,7 +605,7 @@ fn ps_outputs() -> Vec<u8> {
     s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false })
 }
 
-/// `testdata/dxc_vs_control.hlsl`: outputs that depend on inputs only
+/// `tests/data/dxil/dxc_vs_control.hlsl`: outputs that depend on inputs only
 /// through branches and a loop (control dependence in the PSV0 tables).
 fn vs_control() -> Vec<u8> {
     let mut s = Shader::new(Stage::Vertex, (6, 6));
@@ -646,9 +668,9 @@ fn vs_control() -> Vec<u8> {
 }
 
 
-const DXC_MS_PAYLOAD: &[u8] = include_bytes!("testdata/dxc_ms_payload.dxil");
-const DXC_PS_OUTPUTS: &[u8] = include_bytes!("testdata/dxc_ps_outputs.dxil");
-const DXC_VS_CONTROL: &[u8] = include_bytes!("testdata/dxc_vs_control.dxil");
+const DXC_MS_PAYLOAD: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ms_payload.dxil");
+const DXC_PS_OUTPUTS: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ps_outputs.dxil");
+const DXC_VS_CONTROL: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_vs_control.dxil");
 
 #[test]
 fn ms_payload_parts_match_dxc() {
@@ -763,7 +785,7 @@ fn store_all(io: &mut GraphicsIo, s: &mut Shader, stores: &[(Sig, u8, Value)]) {
     }
 }
 
-/// `testdata/dxc_vs_clip.hlsl`: clip and cull distances (two clip elements
+/// `tests/data/dxil/dxc_vs_clip.hlsl`: clip and cull distances (two clip elements
 /// sharing a row), `SV_ViewportArrayIndex`.
 fn vs_clip() -> Vec<u8> {
     let mut s = Shader::new(Stage::Vertex, (6, 6));
@@ -791,7 +813,7 @@ fn vs_clip() -> Vec<u8> {
     s.finish_graphics(io, StageInfo::Vertex)
 }
 
-/// `testdata/dxc_vs_clip_rows.hlsl`: clip/cull distances never share a
+/// `tests/data/dxil/dxc_vs_clip_rows.hlsl`: clip/cull distances never share a
 /// row with user semantics.
 fn vs_clip_rows() -> Vec<u8> {
     let mut s = Shader::new(Stage::Vertex, (6, 6));
@@ -814,8 +836,8 @@ fn vs_clip_rows() -> Vec<u8> {
     s.finish_graphics(io, StageInfo::Vertex)
 }
 
-const DXC_VS_CLIP: &[u8] = include_bytes!("testdata/dxc_vs_clip.dxil");
-const DXC_VS_CLIP_ROWS: &[u8] = include_bytes!("testdata/dxc_vs_clip_rows.dxil");
+const DXC_VS_CLIP: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_vs_clip.dxil");
+const DXC_VS_CLIP_ROWS: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_vs_clip_rows.dxil");
 
 #[test]
 fn vs_clip_parts_match_dxc() {
@@ -832,9 +854,9 @@ fn vs_clip_rows_parts_match_dxc() {
     assert_valid(&c);
 }
 
-const DXC_PS_EARLY: &[u8] = include_bytes!("testdata/dxc_ps_early.dxil");
+const DXC_PS_EARLY: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ps_early.dxil");
 
-/// `testdata/dxc_ps_early.hlsl`: `[earlydepthstencil]` (shader flag only).
+/// `tests/data/dxil/dxc_ps_early.hlsl`: `[earlydepthstencil]` (shader flag only).
 #[test]
 fn ps_early_depth_matches_dxc() {
     let mut s = Shader::new(Stage::Pixel, (6, 6));
@@ -852,9 +874,9 @@ fn ps_early_depth_matches_dxc() {
     assert!(dis.contains("!{i32 0, i64 8}"), "{dis}");
 }
 
-const DXC_VS_UAV: &[u8] = include_bytes!("testdata/dxc_vs_uav.dxil");
+const DXC_VS_UAV: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_vs_uav.dxil");
 
-/// `testdata/dxc_vs_uav.hlsl`: a bound UAV in a vertex shader needs the
+/// `tests/data/dxil/dxc_vs_uav.hlsl`: a bound UAV in a vertex shader needs the
 /// UAVs-at-every-stage flag.
 #[test]
 fn vs_uav_matches_dxc() {
@@ -927,6 +949,9 @@ fn emitted_ps_samples_a_texture_with_implicit_lod() {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::Win32::Graphics::Dxgi::*;
+    if !draw_ready() {
+        return;
+    }
     let (vs, ps) = (fullscreen_vs(), sampling_ps());
     assert_valid(&vs);
     assert_valid(&ps);
@@ -1028,7 +1053,7 @@ fn elements_from_dxbc_rows() {
     assert!(SigElement::from_d3d("X", 0, 999, 3, 1, None).is_none());
 }
 
-/// `testdata/dxc_ps_min16.hlsl` / `dxc_ps_native16.hlsl` (`-enable-16bit-types`):
+/// `tests/data/dxil/dxc_ps_min16.hlsl` / `dxc_ps_native16.hlsl` (`-enable-16bit-types`):
 /// `half2 a : A, uint16_t b : B → half4 SV_Target`.
 fn ps_16bit(native: bool) -> Vec<u8> {
     let mut s = Shader::new(Stage::Pixel, (6, 6));
@@ -1051,8 +1076,8 @@ fn ps_16bit(native: bool) -> Vec<u8> {
     s.finish_graphics(io, StageInfo::Pixel { early_depth_stencil: false })
 }
 
-const DXC_PS_MIN16: &[u8] = include_bytes!("testdata/dxc_ps_min16.dxil");
-const DXC_PS_NATIVE16: &[u8] = include_bytes!("testdata/dxc_ps_native16.dxil");
+const DXC_PS_MIN16: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ps_min16.dxil");
+const DXC_PS_NATIVE16: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ps_native16.dxil");
 
 #[test]
 fn ps_16bit_signatures_match_dxc() {
@@ -1078,10 +1103,10 @@ fn groupshared_bytes_follow_the_16bit_layout() {
     assert_eq!(s.m.global_bytes(3), 36);
 }
 
-const DXC_CS_RESOURCES: &[u8] = include_bytes!("testdata/dxc_cs_resources.dxil");
-const DXC_PS_RESOURCES: &[u8] = include_bytes!("testdata/dxc_ps_resources.dxil");
+const DXC_CS_RESOURCES: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_cs_resources.dxil");
+const DXC_PS_RESOURCES: &[u8] = include_bytes!("../../../../../tests/data/dxil/dxc_ps_resources.dxil");
 
-/// `testdata/dxc_cs_resources.hlsl`: statically bound SRVs of every buffer
+/// `tests/data/dxil/dxc_cs_resources.hlsl`: statically bound SRVs of every buffer
 /// kind and a texture (space 1), a cbuffer, a sampler and a comparison
 /// sampler, and a raw UAV — `dx.resources` and PSV0 from the shared
 /// resource helper on the compute path.
@@ -1136,7 +1161,7 @@ fn cs_static_resources_match_dxc() {
     }
 }
 
-/// `testdata/dxc_ps_resources.hlsl`: a root-constant style cbuffer
+/// `tests/data/dxil/dxc_ps_resources.hlsl`: a root-constant style cbuffer
 /// (8 bytes, `b2, space1`), a texture and a sampler on the graphics path.
 #[test]
 fn ps_static_resources_match_dxc() {

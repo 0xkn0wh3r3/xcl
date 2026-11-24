@@ -98,8 +98,11 @@ fn direct_and_hlsl_graphics_stages_link() {
     use crate::gpu::dxbc::SigElement as S;
     use crate::gpu::recomp::{runner, translate, Mode, Options, PsInterface, VsInterface};
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
-    if runner::adapter().is_err() || crate::gpu::recomp::dxc::location().is_err() {
-        return runner::skip_test("no GPU");
+    if !super::graphics::tests::draw_ready() {
+        return;
+    }
+    if crate::gpu::recomp::dxc::location().is_err() {
+        return runner::skip_test("no DXC");
     }
     let el = |name: &str, index: u32, sv: u32, ct: u32, reg: u32, mask: u8| S { name: name.into(), index, system_value: sv, component_type: ct, register: reg, mask, rw_mask: mask, stream: 0 };
     const V: u64 = 256;
