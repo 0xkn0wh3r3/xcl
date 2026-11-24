@@ -1116,16 +1116,46 @@ fn measure_pso_result(input: &Input, hash: u64, repeat: usize, windows: u32, spl
 /// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
 /// ABI root signature with its static samplers). Save the driver's compiled blob in the same
 /// cache the runtime reads at startup. Nothing runs on the GPU.
+/// Programs whose DXIL is over `XCL_PIPELINE_MAX_KB` (8 MiB by default; 0 turns the cap off)
+/// and that have no blob yet are counted as capped and left to the runtime: their driver
+/// compile takes tens of minutes and gigabytes, and stopped the pass on the biggest programs
+/// (the > 8 MB HLSL programs DXC compiles at `-O0`, #1269).
 struct Pipelines {
     dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
     signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
     made: AtomicUsize,
     refused: AtomicUsize,
     reused: AtomicUsize,
+    /// programs over `max_dxil` with no blob yet, and their DXIL bytes
+    capped: AtomicUsize,
+    capped_bytes: AtomicUsize,
     /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
     /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
     running: (Mutex<usize>, std::sync::Condvar),
     most: usize,
+    /// DXIL bytes a pipeline is still handed to the driver (`XCL_PIPELINE_MAX_KB`, 8 MiB; 0: off)
+    max_dxil: usize,
+}
+
+/// `XCL_PIPELINE_MAX_KB`: the KiB of DXIL `--pipelines` still compiles (default 8 MiB; 0: no
+/// cap). Above it sit the programs whose driver compile takes tens of minutes and gigabytes —
+/// the > 8 MB HLSL programs DXC compiles at `-O0` (#1269) — and they hang the pass.
+fn pipeline_cap_kb(set: Option<&str>) -> usize {
+    set.and_then(|v| v.parse().ok()).unwrap_or(8192)
+}
+
+#[cfg(test)]
+mod pipeline_cap_tests {
+    use super::pipeline_cap_kb;
+
+    #[test]
+    fn the_cap_is_8_mib_unless_set_and_off_at_zero() {
+        assert_eq!(pipeline_cap_kb(None), 8192);
+        assert_eq!(pipeline_cap_kb(Some("512")), 512);
+        assert_eq!(pipeline_cap_kb(Some("0")), 0);
+        // not a number: the default, not a crash
+        assert_eq!(pipeline_cap_kb(Some("off")), 8192);
+    }
 }
 
 // D3D12 devices and root signatures are free-threaded
@@ -1141,7 +1171,8 @@ impl Pipelines {
             let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
             let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
             let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
-            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+            let max_dxil = pipeline_cap_kb(std::env::var("XCL_PIPELINE_MAX_KB").ok().as_deref()).saturating_mul(1024);
+            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), reused: AtomicUsize::new(0), capped: AtomicUsize::new(0), capped_bytes: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most, max_dxil })
         }
     }
 
@@ -1170,6 +1201,18 @@ impl Pipelines {
             CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
             ..Default::default()
         };
+        use crate::hle::d3d12x::real::driver_cache;
+        let path = driver_cache::path(&c.dxil, desc.Flags.0);
+        let cached = path.as_deref().and_then(driver_cache::load);
+        // over the cap and no blob from an earlier run: the driver's compile of this one takes
+        // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
+        // when a title needs the pipeline. `XCL_PIPELINE_MAX_KB` 0 turns the cap off.
+        if cached.is_none() && self.max_dxil != 0 && c.dxil.len() > self.max_dxil {
+            self.capped.fetch_add(1, Ordering::Relaxed);
+            self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            return;
+        }
         {
             let mut n = self.running.0.lock().unwrap();
             while *n >= self.most {
@@ -1177,9 +1220,6 @@ impl Pipelines {
             }
             *n += 1;
         }
-        use crate::hle::d3d12x::real::driver_cache;
-        let path = driver_cache::path(&c.dxil, desc.Flags.0);
-        let cached = path.as_deref().and_then(driver_cache::load);
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
@@ -1340,6 +1380,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, on
     if let Some(p) = pipelines {
         println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
         println!("pipelines loaded from the driver cache {}", p.reused.load(Ordering::Relaxed));
+        let capped = p.capped.load(Ordering::Relaxed);
+        if capped != 0 {
+            println!("pipelines over the {} MiB DXIL cap, left to the runtime: {} ({} MiB of DXIL; XCL_PIPELINE_MAX_KB)", p.max_dxil >> 20, capped, p.capped_bytes.load(Ordering::Relaxed) >> 20);
+        }
     }
     for e in errors.into_inner().unwrap() {
         println!("  {e}");
