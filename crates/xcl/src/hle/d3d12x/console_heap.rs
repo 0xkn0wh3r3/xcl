@@ -176,11 +176,11 @@ pub fn window_views_failed() -> bool {
 
 /// The memory windows' buffers `(resource, bytes)` as raw UAVs at `MEM_HEAP_BASE + k` of the
 /// shared heap, made now if need be (`Options::heap_windows`: shaders take window k from there).
-/// The legacy 4-window layout fills missing slots with window 0; wider layouts (8 / 16) require
-/// every window buffer to be valid.
+/// Active windows (`bytes > 0`) in wider layouts (8 / 16) must all have a valid buffer; unused
+/// trailing slots (`(0, 0)`) safely alias window 0's buffer.
 pub unsafe fn set_window_views(dev: &ID3D12Device, windows: &[(usize, usize)]) -> bool {
     let count = windows.len().max(crate::gpu::uma::MAX_WINDOWS);
-    let complete = count <= crate::gpu::uma::MAX_WINDOWS || windows.iter().all(|w| w.0 != 0);
+    let complete = count <= crate::gpu::uma::MAX_WINDOWS || windows.iter().all(|&(raw, bytes)| raw != 0 || bytes == 0);
     let ok = count <= crate::gpu::uma::MAX_HEAP_WINDOWS && complete && windows.first().is_some_and(|w| w.0 != 0) && shared_heap(dev) && {
         let (device, cpu, inc) = {
             let g = GLOBAL.lock().unwrap();
@@ -589,7 +589,12 @@ mod tests {
             let mut windows = [window; crate::gpu::uma::MAX_HEAP_WINDOWS];
             assert!(set_window_views(&dev, &windows));
             assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32);
+            // Unused trailing window `(0, 0)` safely aliases window 0; an active window that failed
+            // to open `(0, bytes > 0)` is rejected.
             windows[7] = (0, 0);
+            assert!(set_window_views(&dev, &windows));
+            assert_eq!(CALLS.swap(0, Ordering::Relaxed), windows.len() as u32);
+            windows[7] = (0, 0x10000);
             assert!(!set_window_views(&dev, &windows));
             assert_eq!(CALLS.load(Ordering::Relaxed), 0);
             assert!(UNLOCKED.load(Ordering::Relaxed), "device callback ran while GLOBAL was locked");

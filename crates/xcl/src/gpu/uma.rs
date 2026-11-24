@@ -32,11 +32,17 @@ pub const MAX_WINDOWS: usize = 4;
 /// Maximum number of windows addressable through the shared descriptor heap (`XCL_HEAP_WINDOWS=1`).
 pub const MAX_HEAP_WINDOWS: usize = 16;
 
+/// Maximum sparse VRAM windows reserved in runtime layouts (3 × 4 GiB = 12 GiB VA).
+/// Keeping sparse VA capped at 12 GiB prevents huge startup `MEM_64K_PAGES` title heaps from
+/// being pulled into sparse VRAM (which causes multi-minute tile-mapping stalls and multi-GB
+/// sparse pool bloat), while still giving expanded 8/16-window layouts extra coherent windows.
+const MAX_RUNTIME_SPARSE_WINDOWS: usize = 3;
+
 /// Maximum number of committed coherent windows in an expanded runtime layout.
-/// Always leaves at least 3 sparse VRAM windows (12 GiB).
+/// Always leaves 3 sparse VRAM windows (12 GiB): 1 coherent for 4-window, 5 for 8-window, 13 for 16-window.
 fn max_coherent_windows(windows: usize) -> usize {
     if windows > MAX_WINDOWS {
-        windows.saturating_sub(3).min(4).max(1)
+        windows.saturating_sub(MAX_RUNTIME_SPARSE_WINDOWS).max(1)
     } else {
         1
     }
@@ -239,7 +245,7 @@ impl Uma {
     fn reserve_runtime(size: usize, coherent: usize, windows: usize) -> Option<Uma> {
         let coh_sizes = coherent_window_sizes(size, coherent, windows);
         let coh_wins = coh_sizes.len();
-        let sparse_wins = windows - coh_wins;
+        let sparse_wins = (windows - coh_wins).min(MAX_RUNTIME_SPARSE_WINDOWS);
         let sparse_len = sparse_wins * WINDOW;
         for slot in (windows..slot_limit(windows)).step_by(windows) {
             let base = slot << 32;
@@ -272,7 +278,8 @@ impl Uma {
                 continue;
             }
             let mut inner = Inner::default();
-            let mut kinds = vec![WindowKind::Sparse; windows];
+            let mut kinds = vec![WindowKind::None; windows];
+            kinds[..sparse_wins].fill(WindowKind::Sparse);
             for (c, &c_size) in coh_sizes.iter().enumerate() {
                 let k = sparse_wins + c;
                 inner.free.insert(k * WINDOW, c_size);
@@ -342,9 +349,15 @@ impl Uma {
         self.kinds.iter().any(|w| matches!(w, WindowKind::Sparse))
     }
 
-    /// Windows translated shaders address (`mem`, `mem1` …): highest active window + 1.
+    /// Windows translated shaders address (`mem`, `mem1` …): full configured aperture for
+    /// sparse runtime layouts (keeping shader cache keys aligned with `XCL_UMA_WINDOWS=8|16`
+    /// even when trailing slots are unallocated), or highest active window + 1 otherwise.
     pub fn shader_windows(&self) -> usize {
-        self.kinds.iter().rposition(|w| !matches!(w, WindowKind::None)).map_or(0, |i| i + 1)
+        if self.has_sparse() {
+            self.kinds.len()
+        } else {
+            self.kinds.iter().rposition(|w| !matches!(w, WindowKind::None)).map_or(0, |i| i + 1)
+        }
     }
 
     /// Whether `p` is in a sparse window.
@@ -1058,17 +1071,22 @@ mod tests {
             assert!(u.base() + aperture <= (1usize << 40), "expanded aperture must fit below 40-bit VA limit");
             assert_eq!(u.shader_windows(), windows);
             assert_eq!(u.windows(), 1);
-            for k in 0..windows - 1 {
+            // Sparse VA stays capped at 3 windows (12 GiB) so huge startup heaps stay off sparse VRAM.
+            for k in 0..MAX_RUNTIME_SPARSE_WINDOWS {
                 assert!(u.is_sparse_window(k), "window {k} should be sparse");
             }
-            assert_eq!(u.committed_window(), Some(windows - 1));
+            assert_eq!(u.committed_window(), Some(MAX_RUNTIME_SPARSE_WINDOWS));
+            for k in (MAX_RUNTIME_SPARSE_WINDOWS + 1)..windows {
+                assert!(!u.is_sparse_window(k) && !u.is_committed_window(k), "unused trailing window {k} stays unreserved");
+            }
             let c = u.alloc(0x2_0000, 0).unwrap() as usize;
-            assert_eq!(u.window_of(c), Some(windows - 1));
+            assert_eq!(u.window_of(c), Some(MAX_RUNTIME_SPARSE_WINDOWS));
             assert!(u.free(c));
-            // Reserve >12 GiB (larger than legacy 3 sparse windows) in windows 1+ while preserving window 0 headroom.
-            let big = (windows - 2) * WINDOW;
-            let r = u.sparse_reserve(big).expect("large title reservation in expanded sparse windows");
+            // Window 1..2 hold large reservations while preserving window 0 descriptor headroom; >12 GiB overflows cleanly.
+            let big = 2 * WINDOW;
+            let r = u.sparse_reserve(big).expect("8 GiB reservation in sparse windows 1..2");
             assert_eq!(u.window_of(r), Some(1));
+            assert!(u.sparse_reserve(4 * WINDOW).is_none(), "reservations beyond 12 GiB sparse cap must overflow to host RAM");
             let (d, ld) = u.sparse_alloc_in(0, GRAIN, GRAIN).expect("window 0 descriptor headroom intact");
             assert_eq!(u.window_of(d), Some(0));
             assert_eq!(u.sparse_release(d), Some(ld));
@@ -1076,7 +1094,10 @@ mod tests {
             assert_eq!(u.sparse_used(), 0);
             assert_eq!(
                 u.watch_regions(),
-                vec![(u.base(), (windows - 1) * WINDOW), (u.base() + (windows - 1) * WINDOW, 16 << 20)]
+                vec![
+                    (u.base(), MAX_RUNTIME_SPARSE_WINDOWS * WINDOW),
+                    (u.base() + MAX_RUNTIME_SPARSE_WINDOWS * WINDOW, 16 << 20),
+                ]
             );
         }
     }
@@ -1104,13 +1125,18 @@ mod tests {
     fn expanded_runtime_layout_splits_large_coherent_heaps_across_multiple_windows() {
         // Legacy 4-window layout stays capped at 1 coherent window (4095 MiB).
         assert_eq!(coherent_window_sizes(6 << 30, 6 << 30, MAX_WINDOWS), vec![MAX_SIZE]);
-        // 8- and 16-window layouts split >4 GiB coherent heaps across multiple committed windows
-        // with exact remainder sizing (no wasted RAM commit) while preserving >=3 sparse windows.
+        // 8- and 16-window layouts split >4 GiB coherent heaps across up to 5 / 13 committed windows
+        // with exact remainder sizing while keeping sparse windows capped at 3 (12 GiB).
         let want = MAX_SIZE + (512 << 20);
         for w in [8usize, MAX_HEAP_WINDOWS] {
             assert_eq!(coherent_window_sizes(want, want, w), vec![MAX_SIZE, 512 << 20]);
-            assert_eq!(coherent_window_sizes(20 << 30, 20 << 30, w).len(), 4);
+            assert_eq!(coherent_window_sizes(5 * MAX_SIZE, 5 * MAX_SIZE, w).len(), 5);
         }
+        assert_eq!(coherent_window_sizes(20 << 30, 20 << 30, 8).len(), 5);
+        assert_eq!(coherent_window_sizes(20 << 30, 20 << 30, MAX_HEAP_WINDOWS).len(), 6);
+        assert_eq!(max_coherent_windows(MAX_WINDOWS), 1);
+        assert_eq!(max_coherent_windows(8), 5);
+        assert_eq!(max_coherent_windows(MAX_HEAP_WINDOWS), 13);
         // Multi-window Uma::alloc seamlessly spills into the 2nd committed window.
         let u = Uma::with_windows(2, 8 << 20).unwrap();
         let a = u.alloc(6 << 20, GRAIN).unwrap() as usize;
