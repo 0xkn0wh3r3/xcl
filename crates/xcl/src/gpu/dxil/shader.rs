@@ -468,7 +468,7 @@ impl Shader {
         let one = m.md_i32(1);
         let ver = m.md_i32(self.sm.1);
         let dx_version = m.md_node(&[Some(one), Some(ver)]);
-        let valver = m.md_i32(8);
+        let valver = m.md_i32(super::validate::VALVER.1);
         let dx_valver = m.md_node(&[Some(one), Some(valver)]);
         let prefix = m.md_str(self.stage.profile_prefix());
         let smaj = m.md_i32(self.sm.0);
@@ -500,6 +500,11 @@ impl Shader {
         let name = m.md_str("main");
         let entry = m.md_node(&[Some(fmd), Some(name), None, resources, Some(props_node)]);
 
+        // `!llvm.ident`, as DXC writes first: AMD's driver compiler (amdxc64) crashes at
+        // PSO creation on modules without it.
+        let ident = m.md_str("xcl");
+        let ident = m.md_node(&[Some(ident)]);
+        m.named_md("llvm.ident", &[ident]);
         m.named_md("dx.version", &[dx_version]);
         m.named_md("dx.valver", &[dx_valver]);
         m.named_md("dx.shaderModel", &[shader_model]);
