@@ -203,7 +203,7 @@ fn make_reducible(blocks: &mut Vec<CfgBlock>) -> Result<(Vec<usize>, BTreeSet<us
         let mut copy = vec![usize::MAX; n];
         for b in (0..n).filter(|&b| region[b] && b != h) {
             copy[b] = blocks.len();
-            blocks.push(CfgBlock { insts: blocks[b].insts.clone(), term: blocks[b].term.clone(), preds: Vec::new() });
+            blocks.push(CfgBlock { pc: blocks[b].pc, insts: blocks[b].insts.clone(), term: blocks[b].term.clone(), preds: Vec::new() });
         }
         let redirect = |term: &mut Term, to: &dyn Fn(usize) -> usize| match term {
             Term::Jump(x) => *x = to(*x),
@@ -330,7 +330,7 @@ mod tests {
     use super::*;
 
     fn blk(term: Term) -> CfgBlock {
-        CfgBlock { insts: Vec::new(), term, preds: Vec::new() }
+        CfgBlock { pc: 0, insts: Vec::new(), term, preds: Vec::new() }
     }
 
     /// The console's loop entered in the middle (`62b584e061c05fc5`'s shape): 0 → {1 | 3},
