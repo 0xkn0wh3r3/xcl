@@ -96,44 +96,11 @@ impl Cfg {
                 }
             }
         }
-        // reverse post-order from the entry (iterative DFS)
-        let n = blocks.len();
-        let succ = |b: &CfgBlock| -> Vec<usize> {
-            match b.term {
-                Term::Jump(t) => vec![t],
-                Term::Cond(_, t, f) => vec![t, f],
-                Term::End => vec![],
-            }
-        };
-        let mut state = vec![0u8; n]; // 0 new, 1 on stack, 2 done
-        let mut post = Vec::new();
-        let mut headers = BTreeSet::new();
-        if n > 0 {
-            let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
-            state[0] = 1;
-            while let Some(&mut (b, ref mut k)) = stack.last_mut() {
-                let s = succ(&blocks[b]);
-                if *k < s.len() {
-                    let t = s[*k];
-                    *k += 1;
-                    match state[t] {
-                        0 => {
-                            state[t] = 1;
-                            stack.push((t, 0));
-                        }
-                        1 => {
-                            headers.insert(t);
-                        }
-                        _ => {}
-                    }
-                } else {
-                    state[b] = 2;
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
+        // DXIL requires reducible control flow (AMD's compiler faults on an irreducible
+        // CFG; the console compiler emits loops entered in the middle): split nodes until
+        // every retreating edge is a back edge to a dominator
+        let (post, headers) = make_reducible(&mut blocks)?;
+        let succ = succ_of;
         let reach: BTreeSet<usize> = post.iter().copied().collect();
         for &b in &post {
             for t in succ(&blocks[b]) {
@@ -144,5 +111,208 @@ impl Cfg {
         }
         let _ = reach;
         Ok(Cfg { insts, blocks, rpo: post, headers })
+    }
+}
+
+/// Makes the CFG reducible by splitting: for an irreducible edge's innermost multi-entry
+/// cycle region, the region minus its first entry (in RPO) is copied for the edges entering
+/// it elsewhere. The reverse post-order and loop headers of the result; gives up past four
+/// times the original block count.
+fn make_reducible(blocks: &mut Vec<CfgBlock>) -> Result<(Vec<usize>, BTreeSet<usize>), String> {
+    let limit = 4 * blocks.len() + 256;
+    loop {
+        let (post, headers) = order(blocks);
+        let Some((_, t)) = irreducible_edge(blocks, &post) else { return Ok((post, headers)) };
+        let n = blocks.len();
+        let mut pos = vec![usize::MAX; n];
+        for (i, &b) in post.iter().enumerate() {
+            pos[b] = i;
+        }
+        let mut preds = vec![Vec::new(); n];
+        for &b in &post {
+            for s in succ_of(&blocks[b]) {
+                preds[s].push(b);
+            }
+        }
+        // nodes reachable from `from` within `inside`, along successors or predecessors
+        let reach = |from: usize, inside: &[bool], fwd: bool| {
+            let mut seen = vec![false; n];
+            let mut stack = vec![from];
+            seen[from] = true;
+            while let Some(x) = stack.pop() {
+                let next = if fwd { succ_of(&blocks[x]) } else { preds[x].clone() };
+                for y in next {
+                    if inside[y] && !seen[y] {
+                        seen[y] = true;
+                        stack.push(y);
+                    }
+                }
+            }
+            seen
+        };
+        // shrink to the innermost cycle region around `t` with more than one entry
+        let mut inside: Vec<bool> = (0..n).map(|b| pos[b] != usize::MAX).collect();
+        let (region, entries) = loop {
+            let (f, r) = (reach(t, &inside, true), reach(t, &inside, false));
+            let region: Vec<bool> = (0..n).map(|b| f[b] && r[b]).collect();
+            let entries: Vec<usize> = (0..n).filter(|&b| region[b] && (b == post[0] || preds[b].iter().any(|&p| !region[p]))).collect();
+            if entries.len() != 1 {
+                break (region, entries);
+            }
+            inside = region;
+            inside[entries[0]] = false;
+            if !inside[t] {
+                return Err("irreducible control flow (no multi-entry region)".into());
+            }
+        };
+        if blocks.len() >= limit || entries.is_empty() {
+            return Err(format!("irreducible control flow (still after splitting to {} blocks)", blocks.len()));
+        }
+        let h = *entries.iter().min_by_key(|&&e| pos[e]).unwrap();
+        let mut copy = vec![usize::MAX; n];
+        for b in (0..n).filter(|&b| region[b] && b != h) {
+            copy[b] = blocks.len();
+            blocks.push(CfgBlock { insts: blocks[b].insts.clone(), term: blocks[b].term.clone(), preds: Vec::new() });
+        }
+        let redirect = |term: &mut Term, to: &dyn Fn(usize) -> usize| match term {
+            Term::Jump(x) => *x = to(*x),
+            Term::Cond(_, x, y) => {
+                *x = to(*x);
+                *y = to(*y)
+            }
+            Term::End => {}
+        };
+        // the copies stay among themselves except for `h` and the region's exits
+        for b in (0..n).filter(|&b| copy[b] != usize::MAX) {
+            redirect(&mut blocks[copy[b]].term, &|x| if copy[x] != usize::MAX { copy[x] } else { x });
+        }
+        // edges from outside the region into its other entries go to the copies
+        for p in (0..n).filter(|&p| !region[p] && pos[p] != usize::MAX) {
+            redirect(&mut blocks[p].term, &|x| if region[x] && x != h { copy[x] } else { x });
+        }
+    }
+}
+
+fn succ_of(b: &CfgBlock) -> Vec<usize> {
+    match b.term {
+        Term::Jump(t) => vec![t],
+        Term::Cond(_, t, f) => vec![t, f],
+        Term::End => vec![],
+    }
+}
+
+/// Reachable blocks in reverse post-order from the entry (iterative DFS) and the targets of
+/// retreating edges.
+fn order(blocks: &[CfgBlock]) -> (Vec<usize>, BTreeSet<usize>) {
+    let n = blocks.len();
+    let succ = succ_of;
+    let mut state = vec![0u8; n]; // 0 new, 1 on stack, 2 done
+    let mut post = Vec::new();
+    let mut headers = BTreeSet::new();
+    if n > 0 {
+        let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+        state[0] = 1;
+        while let Some(&mut (b, ref mut k)) = stack.last_mut() {
+            let s = succ(&blocks[b]);
+            if *k < s.len() {
+                let t = s[*k];
+                *k += 1;
+                match state[t] {
+                    0 => {
+                        state[t] = 1;
+                        stack.push((t, 0));
+                    }
+                    1 => {
+                        headers.insert(t);
+                    }
+                    _ => {}
+                }
+            } else {
+                state[b] = 2;
+                post.push(b);
+                stack.pop();
+            }
+        }
+    }
+    post.reverse();
+    (post, headers)
+}
+
+/// A retreating edge (a, t) of the reverse post-order `rpo` whose target does not dominate
+/// its source (the CFG is irreducible), if any.
+fn irreducible_edge(blocks: &[CfgBlock], rpo: &[usize]) -> Option<(usize, usize)> {
+    let mut pos = vec![usize::MAX; blocks.len()];
+    for (i, &b) in rpo.iter().enumerate() {
+        pos[b] = i;
+    }
+    let mut preds = vec![Vec::new(); blocks.len()];
+    for &b in rpo {
+        for t in succ_of(&blocks[b]) {
+            preds[t].push(b);
+        }
+    }
+    // Cooper–Harvey–Kennedy dominators over the RPO
+    let mut idom = vec![usize::MAX; blocks.len()];
+    let entry = *rpo.first()?;
+    idom[entry] = entry;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &rpo[1..] {
+            let mut nd = usize::MAX;
+            for &p in preds[b].iter().filter(|&&p| idom[p] != usize::MAX) {
+                nd = if nd == usize::MAX {
+                    p
+                } else {
+                    let (mut x, mut y) = (p, nd);
+                    while x != y {
+                        while pos[x] > pos[y] {
+                            x = idom[x];
+                        }
+                        while pos[y] > pos[x] {
+                            y = idom[y];
+                        }
+                    }
+                    x
+                };
+            }
+            if idom[b] != nd {
+                idom[b] = nd;
+                changed = true;
+            }
+        }
+    }
+    let dominates = |a: usize, mut b: usize| loop {
+        if a == b {
+            return true;
+        }
+        if b == entry {
+            return false;
+        }
+        b = idom[b];
+    };
+    rpo.iter().find_map(|&a| succ_of(&blocks[a]).into_iter().find(|&t| pos[t] <= pos[a] && !dominates(t, a)).map(|t| (a, t)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn blk(term: Term) -> CfgBlock {
+        CfgBlock { insts: Vec::new(), term, preds: Vec::new() }
+    }
+
+    /// The console's loop entered in the middle (`62b584e061c05fc5`'s shape): 0 → {1 | 3},
+    /// 1 → 2, cycle 2 → 3 → {2 | 4}; split into a single-entry loop.
+    #[test]
+    fn loop_entered_in_the_middle_is_split() {
+        let mut b = vec![blk(Term::Cond(0, 3, 1)), blk(Term::Jump(2)), blk(Term::Jump(3)), blk(Term::Cond(0, 2, 4)), blk(Term::End)];
+        let (rpo, headers) = order(&b);
+        assert!(irreducible_edge(&b, &rpo).is_some());
+        let (rpo, headers2) = make_reducible(&mut b).unwrap();
+        assert!(irreducible_edge(&b, &rpo).is_none());
+        assert_eq!(b.len(), 6);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers2.len(), 1);
     }
 }

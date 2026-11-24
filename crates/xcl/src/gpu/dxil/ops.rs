@@ -333,10 +333,22 @@ impl Shader {
     /// Bit counts (i16 / i32 / i64 input) → i32.
     pub fn bit_count(&mut self, op: BitCount, v: Value) -> Value {
         let t = self.m.type_of(v);
+        let i32 = self.m.i32();
         if self.is_i64(v) {
             self.require(Feature::Int64Ops);
+            if matches!(op, BitCount::Countbits) {
+                // Count each 32-bit half: AMD's driver (amdxc64, RDNA4) gets
+                // i64 bit ops wrong (see `bfrev`); fuzz seed 1599 reads a wrong
+                // value downstream of `Countbits.i64(i64 2)` there only.
+                let lo = self.m.cast(CastOp::Trunc, v, i32);
+                let c32 = self.m.const_int(t, 32);
+                let hi = self.m.bin(BinOp::LShr, v, c32);
+                let hi = self.m.cast(CastOp::Trunc, hi, i32);
+                let a = self.op(op as u32, "unaryBits", Some(i32), i32, &[lo], FnAttrs::ReadNone);
+                let b = self.op(op as u32, "unaryBits", Some(i32), i32, &[hi], FnAttrs::ReadNone);
+                return self.m.bin(BinOp::Add, a, b);
+            }
         }
-        let i32 = self.m.i32();
         self.op(op as u32, "unaryBits", Some(t), i32, &[v], FnAttrs::ReadNone)
     }
 
