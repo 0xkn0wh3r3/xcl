@@ -265,8 +265,11 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
     // for what it cannot translate yet
     if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
         match direct_compute(blob, sampler_base, windows, split_wave64) {
-            Ok(c) => return Ok(c),
-            Err(e) => crate::xlog_info!("[SHADER] direct DXIL: {} – HLSL path", e.lines().next().unwrap_or("")),
+            Ok(c) => {
+                crate::gpu::dxil::coverage::record_translated("CS");
+                return Ok(c);
+            }
+            Err(e) => direct_fallback("CS", &e),
         }
     }
     // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
@@ -274,8 +277,11 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));
     if stage != Stage::Compute && !ps_debug && crate::gpu::dxil::kernel::enabled_graphics() {
         match direct_graphics(blob, stage, sampler_base, windows) {
-            Ok(c) => return Ok(c),
-            Err(e) => crate::xlog_info!("[SHADER] direct DXIL ({stage:?}): {} – HLSL path", e.lines().next().unwrap_or("")),
+            Ok(c) => {
+                crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
+                return Ok(c);
+            }
+            Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
         }
     }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
@@ -494,6 +500,14 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
     }
 }
 
+/// A direct DXIL translation that fell back to the HLSL path: one structured log line
+/// (`stage=… reason=…`, the reason with operands stripped) and the live summary counter
+/// (`XCL_DIRECT_DXIL_STATS=1`, `gpu::dxil::coverage`).
+fn direct_fallback(stage: &str, err: &str) {
+    let reason = crate::gpu::dxil::coverage::record_fallback(stage, err);
+    crate::xlog_info!("[SHADER] direct DXIL fallback stage={stage} reason=\"{reason}\" detail=\"{}\" – HLSL path", err.lines().next().unwrap_or(""));
+}
+
 /// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
 /// FSPX (driver) containers are left to the HLSL path.
 fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
@@ -611,12 +625,13 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
         let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
         match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
             Ok(k) => {
+                crate::gpu::dxil::coverage::record_translated("MS");
                 let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
                 let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
                 let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
                 return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
             }
-            Err(e) => crate::xlog_info!("[SHADER] direct DXIL (mesh pass): {} – HLSL path", e.lines().next().unwrap_or("")),
+            Err(e) => direct_fallback("MS", &e),
         }
     }
     finish_two_pass(super::translate_mesh(code, ms.clone(), wave64, split_wave64, mem_windows())?, record, ps)

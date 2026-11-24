@@ -717,6 +717,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let pipelines = args.iter().any(|a| a == "--pipelines");
         return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
+    if args.iter().any(|a| a == "--direct") {
+        return direct_sweep(&input, args, top, json, t0);
+    }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
     print(path, &what, agg, top, json, t0, compile)
@@ -1316,4 +1319,105 @@ fn name_hash(name: &str) -> u64 {
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h
+}
+
+/// `--direct [--sample N] [--seed S] [--validate] [--compare] [--split 0|1] [--windows W]`:
+/// every program of a seeded sample of N records (default 200 programs' worth; `--sample 0` =
+/// all) through the direct DXIL translator; per-stage outcomes, a ranked histogram of what it
+/// cannot translate, translation times and (`--compare`) DXIL size vs HLSL + DXC.
+fn direct_sweep(input: &Input, args: &[String], top: usize, json: bool, t0: std::time::Instant) -> i32 {
+    use crate::gpu::dxil::coverage::{self, Report, Sample};
+    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
+    let want = opt("--sample").map(|v| v as usize).unwrap_or(200);
+    let want = if want == 0 { usize::MAX } else { want };
+    let seed = opt("--seed").unwrap_or(1);
+    let validate = args.iter().any(|a| a == "--validate");
+    let compare = args.iter().any(|a| a == "--compare");
+    let windows = opt("--windows").unwrap_or(4) as u32;
+    let split = opt("--split").map(|v| v != 0).unwrap_or(true);
+    // records hold one or more programs: sample records, stop at `want` programs
+    let order = coverage::sample_indices(input.len(), want, seed);
+    let next = AtomicUsize::new(0);
+    let taken = AtomicUsize::new(0);
+    let threads = opt("--threads").map(|v| v.max(1) as usize).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8));
+    let trace = args.iter().any(|a| a == "--trace");
+    // big programs translate slowly (SSA over every guarded access): skip above the cap,
+    // give up on one after the timeout (its thread is left to finish; the process ends soon)
+    let max_bytes = opt("--max-bytes").map(|v| v as usize).unwrap_or(16384);
+    let timeout = std::time::Duration::from_secs(opt("--timeout").unwrap_or(10));
+    let skipped = AtomicUsize::new(0);
+    // translator panics are counted, not printed (`--trace` keeps the messages)
+    if !trace {
+        std::panic::set_hook(Box::new(|_| {}));
+    }
+    let results: Mutex<Vec<(String, Sample)>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&ri) = order.get(i) else { break };
+                if taken.load(Ordering::Relaxed) >= want {
+                    break;
+                }
+                let (name, Some(blob)) = input.get(ri) else { continue };
+                let Some(sh) = xbox::parse(&blob) else { continue };
+                for (fi, f) in sh.fssm.iter().enumerate() {
+                    let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
+                    for p in &f.programs {
+                        if taken.fetch_add(1, Ordering::Relaxed) >= want {
+                            return;
+                        }
+                        let code = &f.data[p.offset..p.offset + p.len];
+                        if max_bytes > 0 && code.len() > max_bytes {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        let wave64 = recomp::detect_wave64(code);
+                        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split, mem_windows: windows, sampler_base: 0 };
+                        if trace {
+                            eprintln!("direct: {name} FSSM#{fi} ({} B, {})", code.len(), coverage::stage_name(&mode));
+                        }
+                        let t = std::time::Instant::now();
+                        let r = {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let (c, m) = (code.to_vec(), mode.clone());
+                            std::thread::spawn(move || {
+                                let _ = tx.send(coverage::translate_mode(&c, &m, o, validate));
+                            });
+                            rx.recv_timeout(timeout).unwrap_or_else(|_| Err(format!("timeout: over {} s", timeout.as_secs())))
+                        };
+                        let time = t.elapsed();
+                        let hlsl_size = (compare && r.is_ok())
+                            .then(|| {
+                                let profile = match mode {
+                                    recomp::Mode::Vertex(_) => "vs_6_6",
+                                    recomp::Mode::Pixel(_) => "ps_6_6",
+                                    _ => "cs_6_6",
+                                };
+                                let opt = recomp::Options { mode: mode.clone(), wave64, split_wave64: wave64 && split, mem_windows: windows, ..Default::default() };
+                                let t = recomp::translate(code, &opt).ok().filter(|t| t.complete())?;
+                                recomp::dxc::compile(&t.hlsl, "main", profile, &[]).ok().map(|d| d.len())
+                            })
+                            .flatten();
+                        let sample = Sample { stage: coverage::stage_name(&mode), result: r.map(|d| d.len()), time, hlsl_size };
+                        results.lock().unwrap().push((format!("{name} FSSM#{fi}"), sample));
+                    }
+                }
+            });
+        }
+    });
+    let mut results = results.into_inner().unwrap();
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut rep = Report::default();
+    for (name, s) in &results {
+        rep.add(name, s);
+    }
+    if json {
+        println!("{}", rep.json(top));
+    } else {
+        println!("{} programs from {} sampled records (seed {seed}; {} over {max_bytes} B skipped){}{}", results.len(), order.len().min(input.len()), skipped.load(Ordering::Relaxed), if validate { ", validated" } else { "" }, if compare { ", compared with HLSL+DXC" } else { "" });
+        print!("{}", rep.text(top));
+        println!("time {:.1} s", t0.elapsed().as_secs_f64());
+    }
+    0
 }

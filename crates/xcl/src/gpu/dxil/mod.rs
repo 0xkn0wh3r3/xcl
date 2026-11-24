@@ -14,6 +14,7 @@
 pub mod bitstream;
 pub mod cfg;
 pub mod container;
+pub mod coverage;
 pub mod graphics;
 pub mod kernel;
 mod lanes;

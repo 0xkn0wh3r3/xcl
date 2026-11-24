@@ -34,6 +34,9 @@ Usage:
       for the recompiler). RPF9 packages are scanned for shader records.
       --recomp: translates every RDNA2 program → HLSL and shows what is missing;
       --compile N: additionally compiles N complete translations with DXC.
+      --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
+      coverage over a seeded sample (default 200 programs, 0 = all); see
+      docs/specs/direct-dxil-coverage.md for --timeout, --max-bytes, --threads, --json.
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
