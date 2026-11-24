@@ -51,6 +51,17 @@ pub(super) fn build_is_wanted() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.demand.lock().unwrap().wanted))
 }
 
+/// Whether one of the title's threads waits for what this thread is doing, to be asked later and
+/// from another thread: a worker's build as `build_is_wanted`; a thread that is not XCL's is the
+/// title's own.
+pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
+    if let Some(p) = BUILDING.with(|b| b.borrow().clone()) {
+        return Box::new(move || p.demand.lock().unwrap().wanted);
+    }
+    let own = crate::state::boot().is_some() && !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-"));
+    Box::new(move || own)
+}
+
 /// A worker's build of `p` (`preload`: by one of the lowest-priority workers).
 fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
@@ -372,6 +383,29 @@ mod used_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(resolve_wait_for(standin, budget), 0x5151, "built by a worker");
+        let _ = released(standin);
+    }
+
+    /// A compile a worker's build starts is wanted once a bind waits for the build – asked from
+    /// another thread, as the DXC workers do; a thread that builds nothing (no title runs here)
+    /// wants nothing.
+    #[test]
+    fn a_waiting_bind_makes_the_builds_compiles_wanted() {
+        let standin = 0x7E57_B005usize;
+        let (tx, rx) = mpsc::channel();
+        submit(standin, true, Box::new(move || {
+            tx.send(wanted_here()).unwrap();
+            let t = std::time::Instant::now();
+            while !build_is_wanted() && t.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            0x5454
+        }));
+        let wanted = rx.recv().unwrap();
+        assert!(!wanted(), "nobody waits yet");
+        assert_eq!(resolve_wait_for(standin, None), 0x5454);
+        assert!(wanted());
+        assert!(!wanted_here()());
         let _ = released(standin);
     }
 
