@@ -5,7 +5,7 @@
 //! `ISG1`/`OSG1`/`PSG1`/`PSV0` container parts.
 //!
 //! Layouts and rules follow DXC's output for small HLSL programs (NCSA
-//! licence; see `docs/specs/direct-dxil-progress-graphics.md`): element
+//! licence; see `docs/specs/2026-11-24-direct-dxil.md`): element
 //! packing is DXC's default prefix-stable first fit, the PSV0 dependency
 //! tables are recomputed from the emitted code the way the validator does.
 

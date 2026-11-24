@@ -115,4 +115,4 @@ logged HLSL fallback is in, corpus coverage and live-title runs are not measured
 yet. Model: a faithful EXEC/ballot model (EXEC and VCC as wave masks, lanes
 predicated per instruction over a structured block CFG); per-lane
 structurization (real divergent control flow instead of predication) is future
-work. Details: `direct-dxil-progress-core.md`.
+work. Coverage on a retail pack: `direct-dxil-coverage.md`.
