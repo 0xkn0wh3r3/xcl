@@ -100,6 +100,11 @@ pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Res
 }
 
 fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel, String> {
+    // memory windows through the descriptor heap (`recomp::HEAP_WINDOWS` in the count,
+    // `XCL_HEAP_WINDOWS=1`) are not translated yet: the caller falls back to HLSL
+    if o.mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0 {
+        return Err("unsupported: heap memory windows (XCL_HEAP_WINDOWS)".into());
+    }
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();

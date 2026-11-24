@@ -3227,6 +3227,17 @@ fn gpu_mesh_mode_reads_memory_windows() {
 /// accesses in window 0.
 #[test]
 fn gpu_memory_windows_above_4_gib() {
+    memory_windows_above_4_gib(false);
+}
+
+/// The same program with the windows taken from the descriptor heap (`Options::heap_windows`):
+/// same results, and no `switch` over windows in the HLSL.
+#[test]
+fn gpu_memory_windows_from_the_heap() {
+    memory_windows_above_4_gib(true);
+}
+
+fn memory_windows_above_4_gib(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3257,9 +3268,13 @@ fn gpu_memory_windows_above_4_gib() {
     let p = prog(&refs);
     let one = translate(&p, &Options::default()).unwrap();
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
-    let dxil = direct_or(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() }), super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap());
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
+    assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
+    let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
+    // the direct translator binds windows as root UAVs only (no heap windows yet)
+    let dxil = if heap { hlsl_dxil() } else { direct_or(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() }), hlsl_dxil()) };
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[(w1 + 0x1000) as u32, hi(w1)]);
@@ -3300,6 +3315,17 @@ fn gpu_memory_windows_above_4_gib() {
 ///   on `global_load`/`global_store` updates the target window accurately.
 #[test]
 fn gpu_memory_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(false);
+}
+
+/// The same with the windows taken from the descriptor heap (`Options::heap_windows`): an
+/// address outside them reads 0 and drops its stores and atomics there too.
+#[test]
+fn gpu_heap_windows_reject_out_of_uma_aliasing() {
+    memory_windows_reject_out_of_uma_aliasing(true);
+}
+
+fn memory_windows_reject_out_of_uma_aliasing(heap: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3353,7 +3379,8 @@ fn gpu_memory_windows_reject_out_of_uma_aliasing() {
     ];
     let refs: Vec<(&str, &str, &[(&str, u64)], Option<u32>)> = list.iter().map(|(a, b, c, d)| (*a, *b, c.as_slice(), *d)).collect();
     let p = prog(&refs);
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() })).unwrap();
+    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap);
     let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
 
     let mut st = KernelState::default();
