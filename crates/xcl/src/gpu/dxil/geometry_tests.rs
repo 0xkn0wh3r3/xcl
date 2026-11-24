@@ -119,11 +119,7 @@ fn expected_records(g: &GsInterface, prims: usize) -> Vec<u32> {
 
 /// The direct translation's records (GPU, mesh pass-through included) for per-lane loops,
 /// cuts and a partial last group, against a model of the program, in the split form and
-/// (64-lane hardware) the native one, where the HLSL path's records must agree too.
-///
-/// The HLSL path's *split* form is not compared: with branches in the GS it emits the ES's
-/// `s_setpc_b64` as a fall-through into the GS code and gives the GS phase's entry pc no
-/// dispatcher case, so the ES phase runs the GS and the GS phase nothing (empty records).
+/// (64-lane hardware) the native one; the HLSL path's records in the same forms must agree too.
 #[test]
 fn gpu_geometry_direct_records() {
     if runner::adapter().is_err() || runner::wave64_programs_supported() != Ok(true) || dxc::location().is_err() || runner::mesh_shaders_supported() != Ok(true) {
@@ -163,12 +159,10 @@ fn gpu_geometry_direct_records() {
         let direct = translate_geometry(&code, opts(split, 1), &g).unwrap().dxil;
         let (_, got) = runner::mesh_draw(&direct, &msb, &ps, 2, rec.record_dwords(), &io, &mem, 32, [0.0; 4]).unwrap();
         check(&format!("direct, split {split}"), &got);
-        if !split {
-            let t = hlsl_geometry(&code, g.clone(), split, 1).unwrap();
-            assert!(t.complete(), "{:?}", t.unsupported_why);
-            let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
-            let (_, got) = runner::mesh_draw(&hlsl, &msb, &ps, 2, rec.record_dwords(), &io, &mem, 32, [0.0; 4]).unwrap();
-            check("HLSL, native", &got);
-        }
+        let t = hlsl_geometry(&code, g.clone(), split, 1).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let hlsl = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let (_, got) = runner::mesh_draw(&hlsl, &msb, &ps, 2, rec.record_dwords(), &io, &mem, 32, [0.0; 4]).unwrap();
+        check(&format!("HLSL, split {split}"), &got);
     }
 }
