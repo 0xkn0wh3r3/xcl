@@ -120,7 +120,9 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         split_wave64,
         cache_dir: dxc::cache_dir(),
     };
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    // the direct DXIL translator's output stays out of the on-disk cache (keyed for the HLSL path)
+    let direct = crate::gpu::dxil::kernel::enabled();
+    let from_disk = || if direct { compile_one() } else { translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one) };
     cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
@@ -259,6 +261,23 @@ mod translated {
 // Changes here, in `fspx`, or in `console_translation` that alter the cached result must bump
 // `TRANSLATION_GLUE_REVISION` in build.rs; cache serialization changes need not bump it.
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+    // `XCL_DIRECT_DXIL=1`: compute shaders through the direct DXIL translator, the HLSL path
+    // for what it cannot translate yet
+    if stage == Stage::Compute && crate::gpu::dxil::kernel::enabled() {
+        match direct_compute(blob, sampler_base, windows, split_wave64) {
+            Ok(c) => return Ok(c),
+            Err(e) => crate::xlog_info!("[SHADER] direct DXIL: {} – HLSL path", e.lines().next().unwrap_or("")),
+        }
+    }
+    // `XCL_DIRECT_DXIL=all`: vertex / pixel shaders too (not with the PS debug hooks below)
+    let ps_debug = stage == Stage::Pixel
+        && (debug_color(blob).is_some() || ["XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR"].iter().any(|v| std::env::var_os(v).is_some()));
+    if stage != Stage::Compute && !ps_debug && crate::gpu::dxil::kernel::enabled_graphics() {
+        match direct_graphics(blob, stage, sampler_base, windows) {
+            Ok(c) => return Ok(c),
+            Err(e) => crate::xlog_info!("[SHADER] direct DXIL ({stage:?}): {} – HLSL path", e.lines().next().unwrap_or("")),
+        }
+    }
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
         t.hlsl = t.hlsl.replacen("    return xo;\n}", &format!("    xo.t0 = float4({r:.3}, {g:.3}, {b:.3}, 1.0);\n    return xo;\n}}"), 1);
@@ -475,6 +494,37 @@ pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
     }
 }
 
+/// A console compute shader through the direct DXIL translator (`gpu::dxil::kernel`).
+/// FSPX (driver) containers are left to the HLSL path.
+fn direct_compute(blob: &[u8], sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)).ok_or("no hardware CS variant")?;
+    let Some(Mode::Compute(cs)) = interface(blob, &sh, f) else { return Err("not a compute interface".into()) };
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    let wave64 = super::detect_wave64(code);
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: windows, sampler_base };
+    let k = crate::gpu::dxil::kernel::translate_compute(code, o, &cs)?;
+    Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
+}
+
+/// A console vertex / pixel shader through the direct DXIL translator.
+fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -> Result<Compiled, String> {
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let want = if stage == Stage::Vertex { 4 } else { 5 };
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == want)).ok_or("no hardware variant")?;
+    let mode = interface(blob, &sh, f).ok_or("unknown shader interface")?;
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    let o = crate::gpu::dxil::kernel::KernelOptions { wave64: super::detect_wave64(code), split: false, mem_windows: windows, sampler_base };
+    let k = match (&mode, stage) {
+        (Mode::Vertex(vs), Stage::Vertex) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs)?,
+        (Mode::Pixel(ps), Stage::Pixel) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps)?,
+        _ => return Err("the shader stage does not match its slot in the PSO".into()),
+    };
+    Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
+}
+
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
@@ -555,7 +605,21 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    finish_two_pass(super::translate_mesh(code, ms.clone(), super::detect_wave64(code), split_wave64, mem_windows())?, record, ps)
+    let wave64 = super::detect_wave64(code);
+    // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
+    if crate::gpu::dxil::kernel::enabled() {
+        let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64, mem_windows: mem_windows(), sampler_base: 0 };
+        match crate::gpu::dxil::kernel::translate_mesh(code, o, ms) {
+            Ok(k) => {
+                let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
+                let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
+                let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
+                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+            }
+            Err(e) => crate::xlog_info!("[SHADER] direct DXIL (mesh pass): {} – HLSL path", e.lines().next().unwrap_or("")),
+        }
+    }
+    finish_two_pass(super::translate_mesh(code, ms.clone(), wave64, split_wave64, mem_windows())?, record, ps)
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,

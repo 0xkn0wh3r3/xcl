@@ -12,13 +12,27 @@
 //! * [`validate`] — `dxil.dll` validator and DXC disassembler as test oracles.
 
 pub mod bitstream;
+pub mod cfg;
 pub mod container;
 pub mod graphics;
+pub mod kernel;
+mod lanes;
+pub mod lower;
+mod lower_gfx;
+mod lower_image;
+mod lower_mem;
+mod lower_valu;
+mod lower_wide;
 pub mod module;
 pub mod ops;
+pub mod ops_core;
+mod prelude;
 pub mod shader;
+pub mod ssa;
 pub mod validate;
 
+#[cfg(test)]
+mod core_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

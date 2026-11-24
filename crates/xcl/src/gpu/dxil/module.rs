@@ -199,6 +199,8 @@ enum Op {
     Gep(Value, Vec<Value>),
     AtomicRmw(RmwOp, Value, Value),
     CmpXchg(Value, Value, Value),
+    /// allocated type, array size (an i32 constant), alignment
+    Alloca(Ty, Value, u32),
     Br(Block),
     CondBr(Value, Block, Block),
     Switch(Value, Block, Vec<(Value, Block)>),
@@ -501,7 +503,8 @@ impl Module {
         self.push(Op::Bin(op, a, b, 0), t)
     }
     /// Floating-point binop (`Add` = fadd, `Sub` = fsub, `Mul` = fmul,
-    /// `UDiv`/`SDiv` = fdiv, `URem`/`SRem` = frem) with fast-math flags.
+    /// `SDiv` = fdiv, `SRem` = frem — the bitcode reader rejects `UDiv` /
+    /// `URem` on floats) with fast-math flags.
     pub fn fbin(&mut self, op: BinOp, a: Value, b: Value, flags: u64) -> Value {
         let t = self.type_of(a);
         debug_assert!(self.is_float(t));
@@ -550,6 +553,25 @@ impl Module {
         debug_assert!(self.blocks[self.cur.0 as usize].iter().all(|&i| matches!(self.insts[i as usize].op, Op::Phi(_))));
         self.push(Op::Phi(Vec::new()), ty)
     }
+    /// A phi of type `ty` placed after the existing phis of block `b`, whatever
+    /// the current block is and whether `b` already holds other instructions
+    /// (on-the-fly SSA construction creates phis in blocks already filled).
+    pub fn phi_at(&mut self, b: Block, ty: Ty) -> Value {
+        let id = self.insts.len() as u32;
+        self.insts.push(InstDef { op: Op::Phi(Vec::new()), ty });
+        let list = &mut self.blocks[b.0 as usize];
+        let at = list.iter().position(|&i| !matches!(self.insts[i as usize].op, Op::Phi(_))).unwrap_or(list.len());
+        list.insert(at, id);
+        Value::Inst(id)
+    }
+    /// Number of incoming edges a phi has so far.
+    pub fn phi_incoming(&self, phi: Value) -> Vec<(Value, Block)> {
+        let Value::Inst(i) = phi else { return Vec::new() };
+        match &self.insts[i as usize].op {
+            Op::Phi(list) => list.clone(),
+            _ => Vec::new(),
+        }
+    }
     pub fn add_incoming(&mut self, phi: Value, v: Value, from: Block) {
         let Value::Inst(i) = phi else { panic!("not a phi") };
         match &mut self.insts[i as usize].op {
@@ -590,6 +612,13 @@ impl Module {
         let st = self.ty(TypeDef::Struct(None, vec![t, b]));
         let pair = self.push(Op::CmpXchg(ptr, cmp, new), st);
         self.extract(pair, 0)
+    }
+    /// `alloca <ty>, align <align>` (a function-local variable, e.g. an indexable array;
+    /// emit it in the entry block).
+    pub fn alloca(&mut self, ty: Ty, align: u32) -> Value {
+        let one = self.i32c(1);
+        let p = self.ptr(ty, 0);
+        self.push(Op::Alloca(ty, one, align), p)
     }
     pub fn br(&mut self, to: Block) {
         let t = self.void();
@@ -907,6 +936,12 @@ impl Module {
                 // [ptr, cmp, new, vol, success ordering, synchscope, failure ordering, weak]
                 w.record(FUNC_CODE_INST_CMPXCHG, &[rel(*p), rel(*c), rel(*n), 0, ORDERING_SEQCST, 1, ORDERING_SEQCST, 0])
             }
+            Op::Alloca(t, n, align) => {
+                // [instty, opty, size (absolute value id), align record (log2 + 1 | explicit type)]
+                let i32t = self.value_ty(*n);
+                let a = align.trailing_zeros() as u64 + 1;
+                w.record(FUNC_CODE_INST_ALLOCA, &[t.0 as u64, i32t.0 as u64, abs(*n), a | 1 << 6])
+            }
             Op::Br(b) => w.record(FUNC_CODE_INST_BR, &[bb(*b)]),
             Op::CondBr(c, t, f) => w.record(FUNC_CODE_INST_BR, &[bb(*t), bb(*f), rel(*c)]),
             Op::Switch(v, d, cases) => {
@@ -1004,6 +1039,7 @@ const FUNC_CODE_INST_BR: u32 = 11;
 const FUNC_CODE_INST_SWITCH: u32 = 12;
 const FUNC_CODE_INST_UNREACHABLE: u32 = 15;
 const FUNC_CODE_INST_PHI: u32 = 16;
+const FUNC_CODE_INST_ALLOCA: u32 = 19;
 const FUNC_CODE_INST_LOAD: u32 = 20;
 const FUNC_CODE_INST_EXTRACTVAL: u32 = 26;
 const FUNC_CODE_INST_CMP2: u32 = 28;
@@ -1050,6 +1086,7 @@ impl Module {
             Op::Gep(p, idx) => InstInfo::Other(std::iter::once(*p).chain(idx.iter().copied()).collect()),
             Op::AtomicRmw(_, p, v) => InstInfo::Other(vec![*p, *v]),
             Op::CmpXchg(p, c, n) => InstInfo::Other(vec![*p, *c, *n]),
+            Op::Alloca(..) => InstInfo::Other(Vec::new()),
             Op::Br(b) => InstInfo::Term(None, vec![*b]),
             Op::CondBr(c, t, f) => InstInfo::Term(Some(*c), vec![*t, *f]),
             Op::Switch(v, d, cases) => InstInfo::Term(Some(*v), std::iter::once(*d).chain(cases.iter().map(|c| c.1)).collect()),

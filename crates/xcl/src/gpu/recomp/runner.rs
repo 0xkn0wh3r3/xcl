@@ -621,8 +621,29 @@ pub fn run_program(code: &[u8], state: &KernelState, extra: &[u32]) -> Result<(K
     Ok((run_code(code, state, &mem)?, at))
 }
 
+/// `XCL_DIRECT_DXIL=1`: kernels are translated by the direct DXIL backend (`gpu::dxil::kernel`)
+/// instead of HLSL + DXC; an unsupported instruction is an error (no fallback).
+pub fn direct_dxil() -> bool {
+    crate::gpu::dxil::kernel::enabled()
+}
+
+/// A kernel through the direct DXIL backend: a wave64 program in the split form where this
+/// adapter needs it, as `options` does for the HLSL path.
+pub fn direct_kernel(code: &[u8], wave64: bool) -> Result<Vec<u8>, String> {
+    direct_kernel_full(code, wave64).map(|k| k.dxil)
+}
+
+/// `direct_kernel` with the static samplers the kernel's root signature needs.
+pub fn direct_kernel_full(code: &[u8], wave64: bool) -> Result<crate::gpu::dxil::kernel::Kernel, String> {
+    crate::gpu::dxil::kernel::translate_full(code, crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split_wave64(), mem_windows: 1, sampler_base: 0 })
+}
+
 /// Translate + compile + run RDNA2 code as a kernel, with test textures and samplers.
 pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[TestTexture], samplers: &[TestSampler]) -> Result<KernelResult, String> {
+    if direct_dxil() {
+        let k = direct_kernel_full(code, true)?;
+        return run_with_statics(&k.dxil, state, mem, textures, samplers, &k.static_samplers);
+    }
     let t = super::translate(code, &options(super::Mode::Kernel))?;
     if !t.complete() {
         return Err(format!("unsupported instructions: {:?}", t.unsupported));
@@ -633,6 +654,10 @@ pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[
 
 /// Translate + compile + run RDNA2 code as a kernel.
 pub fn run_code(code: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelResult, String> {
+    if direct_dxil() {
+        let k = direct_kernel_full(code, true)?;
+        return run_with_statics(&k.dxil, state, mem, &[], &[], &k.static_samplers);
+    }
     let opt = options(super::Mode::Kernel);
     let t = super::translate(code, &opt)?;
     if !t.complete() {

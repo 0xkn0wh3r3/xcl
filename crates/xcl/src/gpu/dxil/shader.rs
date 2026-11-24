@@ -106,11 +106,13 @@ pub(super) struct Binding {
     pub(super) size: u32,
     /// Samplers: `SamplerComparisonState`.
     pub(super) comparison: bool,
+    /// UAVs: `globallycoherent`
+    pub(super) coherent: bool,
 }
 
 impl Binding {
     pub(super) fn new(class: ResClass, space: u32, lower: u32, kind: u32) -> Binding {
-        Binding { class, space, lower, kind, stride: 0, comp_type: 0, atomic64: false, size: 0, comparison: false }
+        Binding { class, space, lower, kind, stride: 0, comp_type: 0, atomic64: false, size: 0, comparison: false, coherent: false }
     }
 }
 
@@ -236,6 +238,17 @@ impl Shader {
         self.bindings.push(Binding::new(ResClass::Uav, space, lower, kind::RAW_BUFFER));
         let h = self.handle_from_binding(ResClass::Uav, lower, lower, space, lower);
         let handle = self.annotate(h, kind::RAW_BUFFER | 0x1000, 0);
+        RawUav { handle, binding: Some(id) }
+    }
+
+    /// `globallycoherent RWByteAddressBuffer` at `u<lower>, space<space>`.
+    pub fn raw_uav_coherent(&mut self, lower: u32, space: u32) -> RawUav {
+        self.require(Feature::RawAndStructuredBuffers);
+        let id = self.bindings.len();
+        self.bindings.push(Binding { coherent: true, ..Binding::new(ResClass::Uav, space, lower, kind::RAW_BUFFER) });
+        let h = self.handle_from_binding(ResClass::Uav, lower, lower, space, lower);
+        // resource properties: IsUAV (bit 12) | IsGloballyCoherent (bit 14)
+        let handle = self.annotate(h, kind::RAW_BUFFER | 0x1000 | 0x4000, 0);
         RawUav { handle, binding: Some(id) }
     }
 
@@ -389,9 +402,9 @@ impl Shader {
             let extra = if ext.is_empty() { None } else { Some(m.md_node(&ext)) };
             match b.class {
                 ResClass::Uav => {
-                    let (k, f) = (m.md_i32(b.kind), m.md_i1(false));
+                    let (k, f, gc) = (m.md_i32(b.kind), m.md_i1(false), m.md_i1(b.coherent));
                     // globallycoherent, hasCounter, rasterizerOrdered.
-                    node.extend([Some(k), Some(f), Some(f), Some(f), extra]);
+                    node.extend([Some(k), Some(gc), Some(f), Some(f), extra]);
                 }
                 ResClass::Srv => {
                     let (k, samples) = (m.md_i32(b.kind), m.md_i32(0));
