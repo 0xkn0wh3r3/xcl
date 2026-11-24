@@ -173,6 +173,8 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         gfx: None,
         gfx_half: None,
         whole_live: Default::default(),
+        guard_override: None,
+        mask_override: None,
         exchange_error: None,
         pc: 0,
     };

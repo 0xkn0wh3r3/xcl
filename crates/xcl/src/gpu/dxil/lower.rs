@@ -194,6 +194,13 @@ pub struct Lw {
     /// set when an exchange was needed where it is not supported
     pub exchange_error: Option<String>,
     pub pc: u64,
+    /// Lowering under an externally chosen guard ([`Lw::inst_guarded`]): when set,
+    /// `act()` (this lane is active: VGPR write selects, guarded memory) returns it
+    /// instead of this lane's bit of the SSA EXEC.
+    pub guard_override: Option<Value>,
+    /// When set, the wave-wide mask cross-lane instructions see (DPP source lanes,
+    /// readfirstlane, ds_swizzle / bpermute) instead of the SSA EXEC.
+    pub mask_override: Option<(Value, Value)>,
 }
 
 impl Lw {
@@ -754,9 +761,39 @@ impl Lw {
 
     /// This lane's EXEC bit.
     pub fn act(&mut self) -> Value {
+        if let Some(g) = self.guard_override {
+            return g;
+        }
         let lo = self.sreg(126);
         let hi = if self.wave64 { self.sreg(127) } else { self.c(0) };
         self.lanebit(lo, hi)
+    }
+
+    /// The wave-wide active mask (lo, hi) cross-lane instructions consult: the
+    /// override if set, else the SSA EXEC (hi = 0 in wave32).
+    pub fn exec_mask(&mut self) -> (Value, Value) {
+        if let Some(m) = self.mask_override {
+            return m;
+        }
+        let lo = self.sreg(126);
+        let hi = if self.wave64 { self.sreg(127) } else { self.c(0) };
+        (lo, hi)
+    }
+
+    /// Lowers one instruction under a guard chosen by the caller instead of the
+    /// SSA EXEC: `guard` (i1) decides whether this lane's VGPR writes and memory
+    /// effects happen (a constant `true` folds every select / branch away);
+    /// `mask`, if given, is the wave-wide mask cross-lane instructions see (e.g. a
+    /// ballot of the guard), else they read the SSA EXEC. Instructions that write
+    /// EXEC still update the SSA EXEC registers (126/127); EXEC read as a plain
+    /// scalar operand (`s_mov s0, exec`) reads them too. Control flow (branches)
+    /// is the caller's business: use this for non-branch instructions.
+    pub fn inst_guarded(&mut self, d: &Decoded, guard: Value, mask: Option<(Value, Value)>) -> LResult<()> {
+        let (g, m) = (self.guard_override.replace(guard), std::mem::replace(&mut self.mask_override, mask));
+        let r = self.inst(d);
+        self.guard_override = g;
+        self.mask_override = m;
+        r
     }
 
     pub fn write32(&mut self, dst: &Dst, val: Value) {

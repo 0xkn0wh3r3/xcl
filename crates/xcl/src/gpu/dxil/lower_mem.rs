@@ -1430,8 +1430,7 @@ impl Lw {
             "ds_swizzle_b32" => {
                 let a = self.vreg(f("ADDR"));
                 let l = self.swizzle_lane(off16 as u64);
-                let el = self.sreg(126);
-                let eh = if self.wave64 { self.sreg(127) } else { self.c(0) };
+                let (el, eh) = self.exec_mask();
                 let v = self.read_lane_half(a, l);
                 let on = self.lanebit_at(el, eh, l);
                 let z = self.c(0);
@@ -1442,8 +1441,7 @@ impl Lw {
             "ds_bpermute_b32" => {
                 let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
                 let m = if self.wave64 { 63 } else { 31 };
-                let el = self.sreg(126);
-                let eh = if self.wave64 { self.sreg(127) } else { self.c(0) };
+                let (el, eh) = self.exec_mask();
                 let x = self.addc(a, off16);
                 let x = self.lshrc(x, 2);
                 let l = self.andc(x, m);
