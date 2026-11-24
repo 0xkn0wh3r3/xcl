@@ -5366,6 +5366,7 @@ void put_bits(inout uint4 r, uint off, uint w, uint v) {
     or_at4(r, i, v << s);
     if (s != 0u && s + w > 32u && i < 3u) or_at4(r, i + 1u, v >> (32u - s));
 }
+uint f16_rtz(float f) { uint h = f32tof16(f) & 0xFFFFu; return h - (uint)and(and(!isnan(f), (h & 0x7FFFu) != 0u), abs(f16tof32(h)) > abs(f)); }
 uint fmt_encode(uint x, uint info, uint c) {
     uint ty = (info >> 3) & 7u; uint w = (info >> (8u + 6u * c)) & 63u; float f = asfloat(x);
     float maxu = w >= 32u ? 4294967295.0f : (float)((1u << w) - 1u);
@@ -5374,11 +5375,17 @@ uint fmt_encode(uint x, uint info, uint c) {
     if (ty == 1u) return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * maxs);
     if (ty == 2u) return (uint)f;
     if (ty == 3u) return (uint)(int)f;
-    if (ty == 4u || ty == 5u || w == 32u) return x;
-    if (w == 16u) return f32tof16(f);
+    if (ty == 4u) return w >= 32u ? x : min(x, (1u << w) - 1u);
+    if (ty == 5u) {
+        if (w >= 32u) return x;
+        int hi = (int)((1u << (w - 1u)) - 1u);
+        return (uint)clamp((int)x, -hi - 1, hi);
+    }
+    if (w == 32u) return x;
+    if (w == 16u) return f16_rtz(f);
     if (isnan(f)) return w == 11u ? 0x7E0u : 0x3F0u;
     if (f <= 0.0f) return 0u;
-    uint h = f32tof16(f);
+    uint h = f16_rtz(f);
     return w == 11u ? ((h >> 4) & 0x7FFu) : ((h >> 5) & 0x3FFu);
 }
 uint4 fmt_pack(uint4 v, uint info) {
@@ -5706,7 +5713,6 @@ uint perm_b32(uint s0, uint s1, uint sel) {
     }
     return r;
 }
-uint f16_rtz(float f) { uint h = f32tof16(f) & 0xFFFFu; return h - (uint)and(and(!isnan(f), (h & 0x7FFFu) != 0u), abs(f16tof32(h)) > abs(f)); }
 // Exact binary16 → unorm16/snorm16 (round-to-nearest-even, NaN → 0, ±Inf/≥1 → ±scale, subnormals exact).
 // Avoids fp32 double-rounding (e.g. 0x3801 * 65535 = 32799.4995 → 32799, not 32800) and DXIL clamp(NaN).
 uint cvt_norm_f16(uint h, uint scale) {
