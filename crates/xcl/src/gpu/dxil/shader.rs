@@ -172,6 +172,9 @@ impl Shader {
         for &a in args {
             params.push(self.m.type_of(a));
         }
+        if let Some(want) = dxc_fn_attrs(op) {
+            debug_assert_eq!(attrs, want, "dx.op {op} ({name}) attributes differ from DXC's");
+        }
         let fty = self.m.func_ty(ret, &params);
         let f = self.m.declare(&full, fty, attrs);
         let opc = self.m.i32c(op);
@@ -529,4 +532,45 @@ impl Shader {
         let psv = Psv { stage: self.stage, min_wave, max_wave, numthreads, resources: psv_res, entry: "main".into() };
         Ok(container::container(self.stage, self.sm, &bitcode, sfi0, &psv))
     }
+}
+
+/// The function attributes DXC gives each `dx.op` declaration (DXC 1.9
+/// `DxilOperations.cpp`, checked against `dxc -Fc` listings). AMD's compiler
+/// is sensitive to them (e.g. `waveGetLaneIndex` must be `readonly`), so
+/// [`Shader::op`] checks every declaration against this table in debug
+/// builds. `None` for opcodes not listed.
+pub fn dxc_fn_attrs(op: u32) -> Option<FnAttrs> {
+    use FnAttrs::*;
+    Some(match op {
+        4 => ReadNone,                         // loadInput
+        5 => NoUnwind,                         // storeOutput
+        6..=56 => ReadNone,                    // unary/binary/tertiary/quaternary/dot
+        57..=66 => ReadOnly,                   // createHandle, cbuffer loads, samples, textureLoad
+        67 => NoUnwind,                        // textureStore
+        68 => ReadOnly,                        // bufferLoad
+        69 | 70 => NoUnwind,                   // bufferStore, bufferUpdateCounter
+        71..=77 => ReadOnly,                   // checkAccess, getDimensions, gathers, sample positions
+        78 | 79 => NoUnwind,                   // atomics
+        80 => NoDuplicate,                     // barrier
+        81 => ReadOnly,                        // calculateLOD
+        82 => NoUnwind,                        // discard
+        83..=96 => ReadNone,                   // derivatives, eval*, sampleIndex, coverage, ids
+        97..=99 => NoUnwind,                   // emitStream, cutStream, emitThenCutStream
+        100..=102 => ReadNone,                 // gsInstanceID, makeDouble, splitDouble
+        110 => NoUnwind,                       // waveIsFirstLane
+        111 => ReadOnly,                       // waveGetLaneIndex
+        112 => ReadNone,                       // waveGetLaneCount
+        113..=123 => NoUnwind,                 // wave / quad ops
+        124..=132 => ReadNone,                 // bitcasts, legacy conversions
+        135 | 136 => NoUnwind,                 // waveAllOp, wavePrefixBitCount
+        137 | 138 => ReadNone,                 // attributeAtVertex, viewID
+        139 => ReadOnly,                       // rawBufferLoad
+        140 => NoUnwind,                       // rawBufferStore
+        165..=169 => NoUnwind,                 // waveMatch, waveMultiPrefix*, mesh outputs
+        170 => ReadOnly,                       // getMeshPayload
+        171 | 172 => NoUnwind,                 // storeVertexOutput, storePrimitiveOutput
+        216..=218 => ReadNone,                 // annotateHandle, createHandleFromBinding/Heap
+        221 => ReadOnly,                       // isHelperLane
+        _ => return Option::None,
+    })
 }

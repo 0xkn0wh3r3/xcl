@@ -29,7 +29,7 @@
 //! hyperbolic / inverse trig ops, and float division (2.5 ULP).
 //! `FMad` may or may not be fused: do not rely on either rounding.
 
-use super::module::{FnAttrs, RmwOp, Ty, Value};
+use super::module::{BinOp, CastOp, FnAttrs, RmwOp, Ty, Value};
 use super::shader::{kind, Feature, RawUav, ResClass, Shader};
 
 // ------------------------------------------------------------------ enums
@@ -311,7 +311,21 @@ impl Shader {
     pub fn bfrev(&mut self, v: Value) -> Value {
         let t = self.m.type_of(v);
         if self.is_i64(v) {
+            // AMD's driver (amdxc64, RDNA3/4) gets `Bfrev.i64` wrong (it
+            // writes the reversed low half into both halves), so reverse
+            // each 32-bit half and swap them.
             self.require(Feature::Int64Ops);
+            let i32 = self.m.i32();
+            let lo = self.m.cast(CastOp::Trunc, v, i32);
+            let c32 = self.m.const_int(t, 32);
+            let hi = self.m.bin(BinOp::LShr, v, c32);
+            let hi = self.m.cast(CastOp::Trunc, hi, i32);
+            let rlo = self.op(30, "unary", Some(i32), i32, &[lo], FnAttrs::ReadNone);
+            let rhi = self.op(30, "unary", Some(i32), i32, &[hi], FnAttrs::ReadNone);
+            let rlo = self.m.cast(CastOp::ZExt, rlo, t);
+            let rlo = self.m.bin(BinOp::Shl, rlo, c32);
+            let rhi = self.m.cast(CastOp::ZExt, rhi, t);
+            return self.m.bin(BinOp::Or, rlo, rhi);
         }
         self.op(30, "unary", Some(t), t, &[v], FnAttrs::ReadNone)
     }
@@ -1020,6 +1034,9 @@ impl Shader {
     pub fn wave_multi_prefix_op(&mut self, v: Value, mask: [Value; 4], op: u8, unsigned: bool) -> Value {
         self.wave_int64(v);
         let t = self.m.type_of(v);
+        // DXC always marks the bitwise ops signed; AMD's compiler removes
+        // the device on `WaveMultiPrefixBitXor` with sop = unsigned.
+        let unsigned = unsigned && !matches!(op, multi_prefix::AND | multi_prefix::OR | multi_prefix::XOR);
         let (o, s) = (self.m.i8c(op), self.m.i8c(unsigned as u8));
         self.op(166, "waveMultiPrefixOp", Some(t), t, &[v, mask[0], mask[1], mask[2], mask[3], o, s], FnAttrs::NoUnwind)
     }
