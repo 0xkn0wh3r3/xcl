@@ -391,8 +391,15 @@ impl Module {
         self.constant(ConstDef::Float(t, bits as u64))
     }
     /// A floating-point constant of a half / float / double type from raw bits.
+    /// Bits above the type's width are ignored (as LLVM's reader truncates
+    /// them), so equal constants intern to one value.
     pub fn const_float(&mut self, ty: Ty, bits: u64) -> Value {
-        assert!(self.is_float(ty));
+        let bits = match self.types[ty.0 as usize] {
+            TypeDef::Half => bits & 0xFFFF,
+            TypeDef::Float => bits & 0xFFFF_FFFF,
+            TypeDef::Double => bits,
+            ref other => panic!("const_float of {other:?}"),
+        };
         self.constant(ConstDef::Float(ty, bits))
     }
     pub fn undef(&mut self, ty: Ty) -> Value {

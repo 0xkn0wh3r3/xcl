@@ -143,3 +143,13 @@ fn atomics_use_bitcode_ordering_codes() {
     assert_eq!(cx[0][4], ORDERING_SEQCST, "cmpxchg success ordering: {:?}", cx[0]);
     assert_eq!(cx[0][6], ORDERING_SEQCST, "cmpxchg failure ordering: {:?}", cx[0]);
 }
+
+#[test]
+fn float_constants_ignore_bits_above_their_width() {
+    let mut m = Module::new();
+    let (f16, f32) = (m.f16(), m.f32());
+    let one = m.f32c(1.0f32.to_bits());
+    assert_eq!(m.const_float(f32, 0xFFFF_0000_0000_0000 | 1.0f32.to_bits() as u64), one);
+    let h = m.const_float(f16, 0x3C00);
+    assert_eq!(m.const_float(f16, 0x1_3C00), h);
+}
