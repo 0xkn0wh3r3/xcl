@@ -907,6 +907,9 @@ fn f32_to_f16(x: f32, rtz: bool) -> u16 {
 
 #[test]
 fn double_unary_legality_matches_dxil_tables() {
+    if !validate::validator_supported() {
+        return validate::skip_validation();
+    }
     // Which float unary ops take an f64 overload (DXIL.rst: FAbs, Saturate only).
     let all = [
         FUnary::FAbs, FUnary::Saturate, FUnary::Cos, FUnary::Sin, FUnary::Exp, FUnary::Frc, FUnary::Log, FUnary::Sqrt, FUnary::Rsqrt, FUnary::RoundNe,
