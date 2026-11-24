@@ -19,6 +19,7 @@ pub mod graphics;
 pub mod kernel;
 mod lanes;
 pub mod lower;
+mod lower_geom;
 mod lower_gfx;
 mod lower_image;
 mod lower_mem;

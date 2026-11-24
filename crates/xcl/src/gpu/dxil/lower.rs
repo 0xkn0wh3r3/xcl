@@ -185,6 +185,8 @@ pub struct Lw {
     pub partner: Partner,
     /// mesh mode: the record slots
     pub mesh: Option<MeshCtx>,
+    /// geometry mode (ES+GS)
+    pub geom: Option<super::lower_geom::GeomCtx>,
     /// VS / PS entry
     pub gfx: Option<super::lower_gfx::GfxCtx>,
     /// a wave32 program in 64-lane hardware: this hardware half is the upper one (i1)
@@ -888,6 +890,9 @@ impl Lw {
         self.dpp_enable = None;
         if name == "s_sendmsg" && self.mesh.is_some() {
             return self.mesh_sendmsg(d);
+        }
+        if self.geom.is_some() && self.geom_inst(d, &name).is_some() {
+            return Ok(());
         }
         if NOOPS.contains(&name.as_str()) {
             return Ok(());
