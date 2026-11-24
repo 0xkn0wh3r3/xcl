@@ -41,3 +41,5 @@ mod ops_tests;
 mod bitreader_tests;
 #[cfg(test)]
 mod fuzz_tests;
+#[cfg(test)]
+mod robustness_tests;
