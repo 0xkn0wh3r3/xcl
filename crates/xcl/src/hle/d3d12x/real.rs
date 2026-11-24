@@ -3395,6 +3395,13 @@ fn with_switch_fallback<R>(mut build: impl FnMut() -> R) -> R {
     if !HEAP_WINDOW_OOM.with(|o| o.replace(false)) {
         return r;
     }
+    if crate::gpu::uma::get().is_some_and(|u| u.shader_windows() > crate::gpu::uma::MAX_WINDOWS) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            crate::xlog_warn!("D3D12.X: the driver refused an expanded-window pipeline; switch-form retry requires XCL_UMA_WINDOWS=4");
+        });
+        return r;
+    }
     let n = SWITCH_FORM_RETRIES.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 100 == 0 {
         crate::xlog_warn!("D3D12.X: the driver ran out of memory on a pipeline with heap windows – building it in the switch form ({} so far)", n + 1);

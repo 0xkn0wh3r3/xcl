@@ -130,7 +130,8 @@ fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel
 /// (as the HLSL compute mode's `globallycoherent` windows).
 fn mem_windows(s: &mut Shader, mem_windows: u32, coherent: bool) -> (Vec<RawUav>, Option<bool>) {
     let heap = mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0;
-    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, 4);
+    let max = if heap { crate::gpu::uma::MAX_HEAP_WINDOWS as u32 } else { crate::gpu::uma::MAX_WINDOWS as u32 };
+    let n = (mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, max);
     if heap && n > 1 {
         let z = s.m.i32c(0);
         return (vec![RawUav { handle: z, binding: None }; n as usize], Some(coherent));
