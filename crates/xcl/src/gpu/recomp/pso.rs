@@ -243,7 +243,7 @@ mod translated {
             );
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
             if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
-                identity_for(&id.to_string(), "xcl-per-lane")
+                identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
             } else {
                 id
             }
