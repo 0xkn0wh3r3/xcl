@@ -1209,6 +1209,14 @@ fn debug_seed() {
     let c = emit(&p);
     println!("{}", validate::disassemble(&c).unwrap());
     println!("{:?}", validate::validate(&c));
+    println!("program: {:#?}
+outs: {:?}", p.segs, p.outs);
+    if let Ok(w) = std::env::var("FUZZ_WATCH") {
+        let i: usize = w.parse().unwrap();
+        let mem = inputs(seed);
+        let exp = interpret(&p, &mem).into_iter().find(|&(j, _)| j == i);
+        println!("watch res[{i}]: CPU {exp:x?}; mem[0..70] = {:x?}", &mem[..70.min(mem.len())]);
+    }
     println!("seed {seed}: {} bytes, {} instructions, gpu_safe {}", c.len(), instructions(&c), p.gpu_safe);
     if p.gpu_safe && matches!(runner::wave32_supported(), Ok(true)) {
         let mem = inputs(seed);
@@ -1273,4 +1281,84 @@ fn shader_flags_follow_plain_instruction_types() {
         let c = s.finish([32, 1, 1], None);
         check_valid(i as u64, &c);
     }
+}
+
+/// Hand-reduced forms of the fuzz seeds that fail only on AMD (RDNA4,
+/// amdxc64), for bisecting on that hardware: `cargo test -p xcl --lib
+/// gpu::dxil::fuzz_tests::amd_reduced_seeds -- --ignored --nocapture`.
+/// Prints one PASS / FAIL line per variant (first mismatching dword) and
+/// panics at the end if any failed. `T::I32` value 0 is the lane index.
+#[test]
+#[ignore]
+fn amd_reduced_seeds() {
+    use Opnd::{C, V};
+    let gpu = matches!(runner::wave32_supported(), Ok(true));
+    if !gpu {
+        eprintln!("SKIPPED: no wave32 GPU");
+        return;
+    }
+    let ins = |dst, op| Inst { dst, op };
+    // Seed 722 shape: x = in[lane]; w = WaveReadLaneFirst(x); a phi over a
+    // divergent switch on x where the default and `case 1` take w (so a lane
+    // alone in `case 1` must still see lane 0's x).
+    let s722 = |countbits_case: bool| {
+        let mut cases = vec![(1u64, vec![], V(3)), (2, vec![], V(0))];
+        let mut tys = vec![T::I32, T::I32, T::I32, T::I32, T::I32];
+        if countbits_case {
+            cases.push((227944867, vec![ins(5, Op::DxUn(DxUn::Count, C(T::I64, 10215786766456627865)))], V(1)));
+            tys.push(T::I32);
+        }
+        Prog { tys, segs: vec![Seg::Load { slot: 0, dsts: vec![1, 2] }, Seg::Wave { v: V(1), lane: None, dst: 3 }, Seg::Switch { sel: V(1), cases, default: (vec![], V(3)), phi: 4 }], lane: 0, outs: vec![4], gpu_safe: true }
+    };
+    // Seed 1599 shape: c = Countbits.i64(2); out ((c >> (lane & 31)) | Bfrev(c)) & 31.
+    let s1599 = |dynamic: bool, rev: bool| {
+        let src = if dynamic { V(2) } else { C(T::I64, 2) };
+        let mut insts = vec![];
+        if dynamic {
+            // in[lane] & 0 | 2, as i64 (2 on every lane, unknown to the driver).
+            insts.push(ins(6, Op::Bin(BinOp::And, V(1), C(T::I32, 0))));
+            insts.push(ins(7, Op::Bin(BinOp::Or, V(6), C(T::I32, 2))));
+            insts.push(ins(2, Op::Cast(CastOp::ZExt, V(7), T::I64)));
+        }
+        insts.push(ins(3, Op::DxUn(DxUn::Count, src)));
+        insts.push(ins(8, Op::Bin(BinOp::And, V(0), C(T::I32, 31))));
+        insts.push(ins(9, Op::Bin(BinOp::LShr, V(3), V(8))));
+        insts.push(ins(4, Op::DxUn(DxUn::Rev, V(3))));
+        insts.push(ins(10, Op::Bin(BinOp::Or, V(9), V(4))));
+        insts.push(ins(5, Op::Bin(BinOp::And, V(10), C(T::I32, 31))));
+        let tys = vec![T::I32, T::I32, T::I64, T::I32, T::I32, T::I32, T::I32, T::I32, T::I32, T::I32, T::I32];
+        let outs = if rev { vec![5, 3, 9, 4] } else { vec![3] };
+        Prog { tys, segs: vec![Seg::Load { slot: 0, dsts: vec![1] }, Seg::Insts(insts)], lane: 0, outs, gpu_safe: true }
+    };
+    let progs = [
+        ("722 switch + WaveReadLaneFirst", s722(false)),
+        ("722 switch + WaveReadLaneFirst + Countbits.i64 case", s722(true)),
+        ("1599 Countbits.i64(const 2)", s1599(false, false)),
+        ("1599 Countbits.i64(const 2) -> shift / Bfrev", s1599(false, true)),
+        ("1599 Countbits.i64(dynamic 2) -> shift / Bfrev", s1599(true, true)),
+    ];
+    let mut failed = 0;
+    for (name, p) in &progs {
+        let c = emit(p);
+        check_valid(0, &c);
+        let mem = inputs(722);
+        let r = runner::run_with(&c, &runner::KernelState::default(), &mem, &[], &[]).unwrap_or_else(|e| panic!("{name}: GPU run: {e}"));
+        match interpret(p, &mem).into_iter().find(|&(i, v)| r.raw[i] != v) {
+            None => eprintln!("PASS {name}"),
+            Some((i, v)) => {
+                failed += 1;
+                eprintln!("FAIL {name}: res[{i}] = {:#x}, CPU {v:#x}\n{}", r.raw[i], validate::disassemble(&c).unwrap_or_else(|d| d));
+            }
+        }
+    }
+    for seed in [722u64, 1599] {
+        let p = generate(seed);
+        let c = emit(&p);
+        let mem = inputs(seed);
+        let r = runner::run_with(&c, &runner::KernelState::default(), &mem, &[], &[]).unwrap_or_else(|e| panic!("seed {seed}: GPU run: {e}"));
+        let bad = interpret(&p, &mem).into_iter().filter(|&(i, v)| r.raw[i] != v).count();
+        eprintln!("{} full seed {seed}: {bad} mismatching dwords", if bad == 0 { "PASS" } else { "FAIL" });
+        failed += (bad != 0) as usize;
+    }
+    assert_eq!(failed, 0, "{failed} AMD repro variants failed");
 }
