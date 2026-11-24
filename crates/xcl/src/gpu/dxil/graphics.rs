@@ -658,34 +658,97 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
             }
         }
     }
-    // Post-dominator sets with a virtual exit `nb`.
-    let all: BTreeSet<usize> = (0..=nb).collect();
-    let mut pdom: Vec<BTreeSet<usize>> = vec![all.clone(); nb + 1];
-    pdom[nb] = [nb].into_iter().collect();
+    // Immediate post-dominators with a virtual exit `nb` (Cooper, Harvey and Kennedy's
+    // iteration over the reverse CFG; sets per block were quadratic in time and memory).
+    let rsucc: Vec<Vec<usize>> = (0..nb).map(|b| if succ[b].is_empty() { vec![nb] } else { succ[b].clone() }).collect();
+    let mut rpreds: Vec<Vec<usize>> = vec![Vec::new(); nb + 1];
+    for (b, ss) in rsucc.iter().enumerate() {
+        for &x in ss {
+            rpreds[x].push(b);
+        }
+    }
+    // reverse postorder of the reverse CFG from the exit
+    let mut order: Vec<usize> = Vec::with_capacity(nb + 1);
+    {
+        let mut seen = vec![false; nb + 1];
+        let mut stack: Vec<(usize, usize)> = vec![(nb, 0)];
+        seen[nb] = true;
+        while let Some((v, k)) = stack.last_mut() {
+            if let Some(&w) = rpreds[*v].get(*k) {
+                *k += 1;
+                if !seen[w] {
+                    seen[w] = true;
+                    stack.push((w, 0));
+                }
+            } else {
+                order.push(*v);
+                stack.pop();
+            }
+        }
+        order.reverse();
+    }
+    let mut rank = vec![usize::MAX; nb + 1];
+    for (k, &v) in order.iter().enumerate() {
+        rank[v] = k;
+    }
+    let mut ipdom: Vec<Option<usize>> = vec![None; nb + 1];
+    ipdom[nb] = Some(nb);
     let mut changed = true;
     while changed {
         changed = false;
-        for b in (0..nb).rev() {
-            let ss: Vec<usize> = if succ[b].is_empty() { vec![nb] } else { succ[b].clone() };
-            let mut new = ss.iter().map(|&x| pdom[x].clone()).reduce(|a, b| a.intersection(&b).copied().collect()).unwrap();
-            new.insert(b);
-            if new != pdom[b] {
-                pdom[b] = new;
+        for &v in order.iter().skip(1) {
+            let mut new: Option<usize> = None;
+            for &x in &rsucc[v] {
+                if ipdom[x].is_none() {
+                    continue;
+                }
+                new = Some(match new {
+                    None => x,
+                    Some(mut p) => {
+                        let mut q = x;
+                        while p != q {
+                            while rank[p] > rank[q] {
+                                p = ipdom[p].unwrap();
+                            }
+                            while rank[q] > rank[p] {
+                                q = ipdom[q].unwrap();
+                            }
+                        }
+                        p
+                    }
+                });
+            }
+            if new.is_some() && ipdom[v] != new {
+                ipdom[v] = new;
                 changed = true;
             }
         }
     }
     // Block b is control dependent on branch block a if b post-dominates a
-    // successor of a but does not strictly post-dominate a.
+    // successor of a but does not strictly post-dominate a: the blocks from the
+    // successor up the post-dominator tree to (excluding) a's immediate post-dominator.
     let mut ctrl: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    let mut stamp = vec![usize::MAX; nb + 1];
     for a in 0..nb {
         if cond[a].is_none() {
             continue;
         }
-        for b in 0..nb {
-            if succ[a].iter().any(|&x| pdom[x].contains(&b)) && !(pdom[a].contains(&b) && a != b) {
-                ctrl[b].push(a);
+        let stop = ipdom[a];
+        let mut marked: Vec<usize> = Vec::new();
+        for &x in &succ[a] {
+            let mut r = Some(x);
+            while let Some(v) = r {
+                if Some(v) == stop || v == nb || stamp[v] == a {
+                    break;
+                }
+                stamp[v] = a;
+                marked.push(v);
+                r = ipdom[v].filter(|&p| p != v);
             }
+        }
+        marked.sort_unstable();
+        for v in marked {
+            ctrl[v].push(a);
         }
     }
     // Instruction → block.
@@ -870,6 +933,7 @@ impl Shader {
         if !self.m.terminated() {
             self.m.ret();
         }
+        self.m.optimize();
         self.infer_type_features();
         let ins = io.place(Dir::In);
         let outs = io.place(Dir::Out);

@@ -15,6 +15,8 @@ use std::collections::HashMap;
 
 use super::bitstream::{signed, BitWriter};
 
+mod opt;
+
 // ---------------------------------------------------------------- types
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -107,7 +109,7 @@ struct GlobalDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Block(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add = 0,
     Sub = 1,
@@ -124,7 +126,7 @@ pub enum BinOp {
     Xor = 12,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CastOp {
     Trunc = 0,
     ZExt = 1,
@@ -139,7 +141,7 @@ pub enum CastOp {
 }
 
 /// Comparison predicates (LLVM `CmpInst::Predicate`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Pred {
     FFalse = 0,
     FOEq = 1,
@@ -170,7 +172,7 @@ pub enum Pred {
 }
 
 /// LLVM atomicrmw operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RmwOp {
     Xchg = 0,
     Add = 1,
@@ -185,7 +187,7 @@ pub enum RmwOp {
     UMin = 10,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Op {
     Bin(BinOp, Value, Value, u64),
     Cast(CastOp, Value, Ty),
@@ -564,6 +566,20 @@ impl Module {
         list.insert(at, id);
         Value::Inst(id)
     }
+    /// A phi of type `ty` not yet in any block (place it with [`Module::place_phi`];
+    /// one never placed is simply not written).
+    pub fn detached_phi(&mut self, ty: Ty) -> Value {
+        let id = self.insts.len() as u32;
+        self.insts.push(InstDef { op: Op::Phi(Vec::new()), ty });
+        Value::Inst(id)
+    }
+    /// Puts a [`Module::detached_phi`] after the existing phis of block `b`.
+    pub fn place_phi(&mut self, b: Block, phi: Value) {
+        let Value::Inst(id) = phi else { panic!("not a phi") };
+        let list = &mut self.blocks[b.0 as usize];
+        let at = list.iter().position(|&i| !matches!(self.insts[i as usize].op, Op::Phi(_))).unwrap_or(list.len());
+        list.insert(at, id);
+    }
     /// Number of incoming edges a phi has so far.
     pub fn phi_incoming(&self, phi: Value) -> Vec<(Value, Block)> {
         let Value::Inst(i) = phi else { return Vec::new() };
@@ -690,8 +706,64 @@ impl Module {
             self.type_of(Value::Func(f as u32));
         }
 
-        let n_globals = self.globals.len() as u64;
-        let n_funcs = self.funcs.len() as u64;
+        // Blocks are written in reverse postorder from the entry (a block after every block
+        // dominating it, so operands are defined before use whatever order the blocks were
+        // created in); unreachable blocks are dropped.
+        let order = self.block_order();
+        let mut block_pos: Vec<Option<u32>> = vec![None; self.blocks.len()];
+        for (k, &b) in order.iter().enumerate() {
+            block_pos[b as usize] = Some(k as u32);
+        }
+
+        // Global variables nothing references (e.g. an exchange array the code never
+        // needed) are left out: the validator rejects unused internal declarations.
+        // Likewise declarations of functions no longer called (after `optimize`).
+        let mut gused = vec![false; self.globals.len()];
+        let mut fused: Vec<bool> = self.funcs.iter().map(|f| f.defined).collect();
+        {
+            let mut mark = |v: Value| match v {
+                Value::Global(g) => gused[g as usize] = true,
+                Value::Func(f) => fused[f as usize] = true,
+                _ => {}
+            };
+            for &b in &order {
+                for &i in &self.blocks[b as usize] {
+                    let op = &self.insts[i as usize].op;
+                    if let Op::Call(f, _) = op {
+                        mark(Value::Func(*f));
+                    }
+                    op.for_each_operand(&mut mark);
+                }
+            }
+            for c in &self.consts {
+                if let ConstDef::Aggregate(_, e) = c {
+                    e.iter().copied().for_each(&mut mark);
+                }
+            }
+            for m in &self.md {
+                if let MdDef::Val(_, v) = m {
+                    mark(*v);
+                }
+            }
+        }
+        let mut gmap: Vec<Option<u64>> = vec![None; self.globals.len()];
+        let mut n_globals = 0u64;
+        for (g, used) in gused.iter().enumerate() {
+            if *used {
+                gmap[g] = Some(n_globals);
+                n_globals += 1;
+            }
+        }
+        let gmap = &gmap;
+        let mut fmap: Vec<Option<u64>> = vec![None; self.funcs.len()];
+        let mut n_funcs = 0u64;
+        for (f, used) in fused.iter().enumerate() {
+            if *used {
+                fmap[f] = Some(n_funcs);
+                n_funcs += 1;
+            }
+        }
+        let fmap = &fmap;
         let n_consts = self.consts.len() as u64;
         let const_base = n_globals + n_funcs;
         let inst_base = const_base + n_consts;
@@ -700,8 +772,8 @@ impl Module {
         let mut inst_ids: Vec<Option<u64>> = vec![None; self.insts.len()];
         {
             let mut next = inst_base;
-            for b in &self.blocks {
-                for &i in b {
+            for &b in &order {
+                for &i in &self.blocks[b as usize] {
                     if !self.is_void(self.insts[i as usize].ty) {
                         inst_ids[i as usize] = Some(next);
                         next += 1;
@@ -711,8 +783,8 @@ impl Module {
         }
         let abs = |v: Value| -> u64 {
             match v {
-                Value::Global(g) => g as u64,
-                Value::Func(f) => n_globals + f as u64,
+                Value::Global(g) => gmap[g as usize].expect("use of a dropped global"),
+                Value::Func(f) => n_globals + fmap[f as usize].expect("use of a dropped function"),
                 Value::Const(c) => const_base + c as u64,
                 Value::Inst(i) => inst_ids[i as usize].expect("use of a void instruction"),
             }
@@ -744,7 +816,7 @@ impl Module {
         w.record_str(MODULE_CODE_TRIPLE, &[], triple);
         w.record_str(MODULE_CODE_DATALAYOUT, &[], datalayout);
 
-        for g in &self.globals {
+        for g in self.globals.iter().enumerate().filter(|(i, _)| gused[*i]).map(|x| x.1) {
             // [valty, addrspace<<2 | explicit_type<<1 | isconst, initid+1, linkage, align, section,
             //  visibility, tls, unnamed_addr, externally_initialized, dllstorage, comdat]
             let init = g.init.map_or(0, |v| abs(v) + 1);
@@ -755,7 +827,7 @@ impl Module {
                 &[g.ty.0 as u64, ((g.addrspace as u64) << 2) | 2 | g.constant as u64, init, linkage, align, 0, 0, 0, 0, 0, 0, 0],
             );
         }
-        for f in &self.funcs {
+        for f in self.funcs.iter().enumerate().filter(|(i, _)| fused[*i]).map(|x| x.1) {
             // [type, cc, isproto, linkage, paramattr, align, section, visibility,
             //  gc, unnamed_addr, prologue, dllstorage, comdat, prefix, personality]
             w.record(
@@ -814,21 +886,27 @@ impl Module {
         // Module value symbol table: names of globals and functions.
         w.enter_block(BLOCK_VALUE_SYMTAB);
         for (i, g) in self.globals.iter().enumerate() {
-            w.record_str(VST_CODE_ENTRY, &[i as u64], &g.name);
+            if let Some(k) = gmap[i] {
+                w.record_str(VST_CODE_ENTRY, &[k], &g.name);
+            }
         }
         for (i, f) in self.funcs.iter().enumerate() {
-            w.record_str(VST_CODE_ENTRY, &[n_globals + i as u64], &f.name);
+            if let Some(k) = fmap[i] {
+                w.record_str(VST_CODE_ENTRY, &[n_globals + k], &f.name);
+            }
         }
         w.end_block();
 
         // The entry's body.
         w.enter_block(BLOCK_FUNCTION);
-        w.record(FUNC_CODE_DECLAREBLOCKS, &[self.blocks.len() as u64]);
+        w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
         let mut inst_id = inst_base;
-        for b in 0..self.blocks.len() {
+        let pos = |b: Block| block_pos[b.0 as usize];
+        for &b in &order {
+            let b = b as usize;
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
-                self.write_inst(&mut w, i, inst_id, &abs);
+                self.write_inst(&mut w, i, inst_id, &abs, &pos);
                 if !self.is_void(self.insts[i].ty) {
                     inst_id += 1;
                 }
@@ -879,14 +957,49 @@ impl Module {
         w.end_block();
     }
 
-    fn write_inst(&self, w: &mut BitWriter, i: usize, inst_id: u64, abs: &dyn Fn(Value) -> u64) {
+    /// Successor blocks of `b` (from its terminator).
+    fn succs(&self, b: usize) -> Vec<Block> {
+        match self.blocks[b].last().map(|&i| &self.insts[i as usize].op) {
+            Some(Op::Br(t)) => vec![*t],
+            Some(Op::CondBr(_, t, f)) => vec![*t, *f],
+            Some(Op::Switch(_, d, cases)) => std::iter::once(*d).chain(cases.iter().map(|c| c.1)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The blocks reachable from the entry, in reverse postorder (iterative DFS).
+    fn block_order(&self) -> Vec<u32> {
+        let n = self.blocks.len();
+        let mut seen = vec![false; n];
+        let mut post = Vec::with_capacity(n);
+        let mut stack: Vec<(usize, Vec<Block>, usize)> = vec![(0, self.succs(0), 0)];
+        seen[0] = true;
+        while let Some((b, succ, k)) = stack.last_mut() {
+            if let Some(&s) = succ.get(*k) {
+                *k += 1;
+                let s = s.0 as usize;
+                if !seen[s] {
+                    seen[s] = true;
+                    let ss = self.succs(s);
+                    stack.push((s, ss, 0));
+                }
+            } else {
+                post.push(*b as u32);
+                stack.pop();
+            }
+        }
+        post.reverse();
+        post
+    }
+
+    fn write_inst(&self, w: &mut BitWriter, i: usize, inst_id: u64, abs: &dyn Fn(Value) -> u64, pos: &dyn Fn(Block) -> Option<u32>) {
         // Relative operand; forward references are only legal in phis.
         let rel = |v: Value| -> u64 {
             let a = abs(v);
             assert!(a < inst_id, "forward reference to value {a} at instruction {inst_id} (blocks must be in dominance order)");
             inst_id - a
         };
-        let bb = |b: Block| b.0 as u64;
+        let bb = |b: Block| pos(b).expect("branch to an unreachable block") as u64;
         match &self.insts[i].op {
             Op::Bin(op, a, b, flags) => {
                 let mut ops = vec![rel(*a), rel(*b), *op as u64];
@@ -907,7 +1020,8 @@ impl Module {
             }
             Op::Phi(inc) => {
                 let mut ops = vec![self.insts[i].ty.0 as u64];
-                for &(v, b) in inc {
+                // edges from unreachable (dropped) blocks go with them
+                for &(v, b) in inc.iter().filter(|(_, b)| pos(*b).is_some()) {
                     ops.push(signed(inst_id as i64 - abs(v) as i64));
                     ops.push(bb(b));
                 }

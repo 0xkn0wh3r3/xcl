@@ -181,7 +181,8 @@ impl Lw {
             let s = io.input(GSig::user(&e.name, e.index, gct(e.component_type), 4).interp(interp));
             ps_in.push((s, float));
         }
-        let ff = (ps.input_ena >> 12 & 1 == 1).then(|| io.input(GSig::new("SV_IsFrontFace", 0, SemKind::IsFrontFace, GCt::Bool, 1).interp(Interp::Constant)));
+        // DXIL wants SV_IsFrontFace as uint (`bool` in HLSL becomes uint 0 / 0xFFFFFFFF)
+        let ff = (ps.input_ena >> 12 & 1 == 1).then(|| io.input(GSig::new("SV_IsFrontFace", 0, SemKind::IsFrontFace, GCt::U32, 1).interp(Interp::Constant)));
         let mut targets = BTreeMap::new();
         let mut depth = None;
         let mut any = false;

@@ -460,6 +460,7 @@ impl Shader {
         if !self.m.terminated() {
             self.m.ret();
         }
+        self.m.optimize();
         self.infer_type_features();
         let flags: u64 = self.features.iter().map(|f| f.metadata_bit()).fold(0, |a, b| a | b);
         let sfi0: u64 = self.features.iter().map(|f| f.container_bit()).fold(0, |a, b| a | b);

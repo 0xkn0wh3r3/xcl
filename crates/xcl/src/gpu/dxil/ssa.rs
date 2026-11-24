@@ -14,9 +14,30 @@ use std::collections::HashMap;
 use super::module::{Block, Ty, Value};
 use super::shader::Shader;
 
+/// Multiplicative hash for the small integer keys of the definition maps (SipHash
+/// dominated the reads of long programs).
+#[derive(Default, Clone, Copy)]
+struct VarHasher(u64);
+
+impl std::hash::Hasher for VarHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.0 = (self.0.rotate_left(5) ^ v as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+type VarMap = HashMap<u32, Value, std::hash::BuildHasherDefault<VarHasher>>;
+
 #[derive(Default)]
 struct SBlock {
-    defs: HashMap<u32, Value>,
+    defs: VarMap,
     preds: Vec<Block>,
     sealed: bool,
     /// predecessors to wait for before sealing automatically (None: sealed explicitly)
@@ -27,12 +48,15 @@ struct SBlock {
 pub struct Ssa {
     blocks: Vec<SBlock>,
     ty: Ty,
+    /// (block, variable) of the sealed joins whose operands are being read, with the
+    /// phi created if a read came back around to the join (a loop)
+    visiting: HashMap<(u32, u32), Option<Value>>,
 }
 
 impl Ssa {
     /// All variables have type `ty`.
     pub fn new(ty: Ty) -> Ssa {
-        Ssa { blocks: Vec::new(), ty }
+        Ssa { blocks: Vec::new(), ty, visiting: HashMap::new() }
     }
 
     fn at(&mut self, b: Block) -> &mut SBlock {
@@ -91,7 +115,7 @@ impl Ssa {
             chain.push(b);
             b = sb.preds[0];
             if let Some(&v) = self.at(b).defs.get(&var) {
-                for c in chain {
+                    for c in chain {
                     self.write(c, var, v);
                 }
                 return v;
@@ -115,11 +139,29 @@ impl Ssa {
                 0 => init(s, var),
                 1 => self.read(s, preds[0], var, init),
                 _ => {
-                    let ty = self.ty;
-                    let phi = s.m.phi_at(b, ty);
-                    self.write(b, var, phi);
-                    self.add_operands(s, phi, &preds, var, init);
-                    phi
+                    // the operands first, without a phi: most joins a read walks through
+                    // (guarded accesses make thousands) see one value from every edge
+                    // (Braun et al.'s trivial phi) and need none. A read that comes back
+                    // here around a loop gets a phi, which then stays.
+                    let key = (b.0, var);
+                    if let Some(slot) = self.visiting.get(&key).copied() {
+                        let phi = slot.unwrap_or_else(|| s.m.detached_phi(self.ty));
+                        self.visiting.insert(key, Some(phi));
+                        return phi;
+                    }
+                    self.visiting.insert(key, None);
+                    let vals: Vec<Value> = preds.iter().map(|&p| self.read(s, p, var, init)).collect();
+                    let marker = self.visiting.remove(&key).flatten();
+                    if marker.is_none() && vals.iter().all(|&v| v == vals[0]) {
+                        vals[0]
+                    } else {
+                        let phi = marker.unwrap_or_else(|| s.m.detached_phi(self.ty));
+                        for (&v, &p) in vals.iter().zip(&preds) {
+                            s.m.add_incoming(phi, v, p);
+                        }
+                        s.m.place_phi(b, phi);
+                        phi
+                    }
                 }
             }
         };
