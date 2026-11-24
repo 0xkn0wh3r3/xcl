@@ -734,6 +734,8 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         return;
     }
     let key = list as usize;
+    // (of a list that was here before and whose release was not seen: the GPU may still use it)
+    release_copy_scratch(key);
     let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -4084,6 +4086,43 @@ mod tests {
             assert_eq!(cache.bytes, small);
             cache.release(second_raw as usize);
             assert_eq!(cache.bytes, 0);
+        }
+    }
+
+    /// A new list at the address of one whose release was not seen does not go on with that one's
+    /// scratch buffer, which the GPU may still use.
+    #[test]
+    fn a_new_list_takes_no_copy_scratch_of_an_earlier_one() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let (raw, key) = (list.as_raw(), list.as_raw() as usize);
+            let small = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+            {
+                let mut cache = COPY_SCRATCH.lock().unwrap();
+                cache.acquire(raw, small).unwrap();
+                let scratch = cache.active.get_mut(&key).unwrap();
+                scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
+            }
+            on_create(raw, alloc.as_raw() as usize, 0, ty);
+            {
+                let cache = COPY_SCRATCH.lock().unwrap();
+                assert!(!cache.active.contains_key(&key), "the new list starts without one");
+                assert!(!cache.released.is_empty(), "the GPU may still use it: it stays until the fence");
+            }
+            fence.Signal(1).unwrap();
+            on_release(key);
+            super::super::alloc_pool::forget(alloc.as_raw() as usize);
         }
     }
 
