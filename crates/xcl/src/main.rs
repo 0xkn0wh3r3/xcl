@@ -38,6 +38,9 @@ Usage:
           compute HLSL for investigation; an exact hash bypasses the size threshold.
       --measure-pso HEX [--repeat N]: times cache-disabled driver compilation of one exact
           compute record with XCL's real root signature and static samplers.
+      --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
+      coverage over a seeded sample (default 200 programs, 0 = all); also
+      --timeout, --max-bytes, --threads, --json, --hash H, --dump DIR.
   xcl rpf <package.rpf> [--top N] [--find NAME] [--extract NAME --out DIR]
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
