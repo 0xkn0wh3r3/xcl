@@ -450,6 +450,7 @@ impl Lw {
             "v_max_f16" => f2!(|s: &mut Self, x, y| s.fmax(x, y)),
             "v_fma_f16" => f3!(|s: &mut Self, x, y, w| s.fmad(x, y, w)),
             "v_med3_f16" => f3!(|s: &mut Self, x, y, w| s.med3f(x, y, w)),
+            "v_div_fixup_f16" => f3!(|s: &mut Self, x, y, w| s.div_fixup(x, y, w)),
             "v_min3_f16" => f3!(|s: &mut Self, x, y, w| {
                 let t = s.fmin(x, y);
                 s.fmin(t, w)
