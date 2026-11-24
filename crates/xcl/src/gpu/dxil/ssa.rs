@@ -43,6 +43,9 @@ struct SBlock {
     /// predecessors to wait for before sealing automatically (None: sealed explicitly)
     expect: Option<usize>,
     incomplete: Vec<(u32, Value)>,
+    /// a region join ([`Ssa::seal_region_join`]): the region's last block and the
+    /// variables it writes
+    region: Option<(Block, Vec<u32>)>,
 }
 
 pub struct Ssa {
@@ -51,12 +54,14 @@ pub struct Ssa {
     /// (block, variable) of the sealed joins whose operands are being read, with the
     /// phi created if a read came back around to the join (a loop)
     visiting: HashMap<(u32, u32), Option<Value>>,
+    /// open write logs (innermost last)
+    logs: Vec<Vec<u32>>,
 }
 
 impl Ssa {
     /// All variables have type `ty`.
     pub fn new(ty: Ty) -> Ssa {
-        Ssa { blocks: Vec::new(), ty, visiting: HashMap::new() }
+        Ssa { blocks: Vec::new(), ty, visiting: HashMap::new(), logs: Vec::new() }
     }
 
     fn at(&mut self, b: Block) -> &mut SBlock {
@@ -94,8 +99,58 @@ impl Ssa {
         self.at(b).preds.clone()
     }
 
+    /// A definition by the program (logged for an open [`Ssa::begin_log`]).
     pub fn write(&mut self, b: Block, var: u32, v: Value) {
+        if let Some(log) = self.logs.last_mut() {
+            log.push(var);
+        }
         self.at(b).defs.insert(var, v);
+    }
+
+    /// A read's result remembered in `b` (not a definition).
+    fn cache(&mut self, b: Block, var: u32, v: Value) {
+        self.at(b).defs.insert(var, v);
+    }
+
+    /// Starts logging the variables written (e.g. in a guarded region).
+    pub fn begin_log(&mut self) {
+        self.logs.push(Vec::new());
+    }
+
+    /// Ends the innermost log: the variables written since `begin_log` (also
+    /// counted in the enclosing log).
+    pub fn end_log(&mut self) -> Vec<u32> {
+        let mut log = self.logs.pop().expect("begin_log");
+        log.sort_unstable();
+        log.dedup();
+        if let Some(outer) = self.logs.last_mut() {
+            outer.extend_from_slice(&log);
+        }
+        log
+    }
+
+    /// Seals the join `j` of a region `cond → (then … end) → j` / `cond → j` whose
+    /// only writes are `written` (sorted): a written variable merges over both edges,
+    /// every other one reads through `cond` directly, as if `cond` were `j`'s only
+    /// predecessor. Reads then skip the region instead of walking both edges of every
+    /// guard (guarded memory accesses make thousands of such joins).
+    pub fn seal_region_join(&mut self, j: Block, cond: Block, end: Block, written: Vec<u32>) {
+        let sb = self.at(j);
+        assert!(!sb.sealed && sb.incomplete.is_empty(), "region join already read");
+        sb.preds = vec![cond];
+        sb.sealed = true;
+        if !written.is_empty() {
+            sb.region = Some((end, written));
+        }
+    }
+
+    /// The predecessors a read of `var` in `b` merges over.
+    fn preds_of(&mut self, b: Block, var: u32) -> Vec<Block> {
+        let sb = self.at(b);
+        match &sb.region {
+            Some((end, w)) if w.binary_search(&var).is_ok() => vec![sb.preds[0], *end],
+            _ => sb.preds.clone(),
+        }
     }
 
     /// The definition of `var` reaching the current end of block `b`.
@@ -109,14 +164,14 @@ impl Ssa {
         let mut b = b;
         loop {
             let sb = self.at(b);
-            if !sb.sealed || sb.preds.len() != 1 {
+            if !sb.sealed || sb.preds.len() != 1 || sb.region.as_ref().is_some_and(|(_, w)| w.binary_search(&var).is_ok()) {
                 break;
             }
             chain.push(b);
             b = sb.preds[0];
             if let Some(&v) = self.at(b).defs.get(&var) {
                     for c in chain {
-                    self.write(c, var, v);
+                    self.cache(c, var, v);
                 }
                 return v;
             }
@@ -124,7 +179,7 @@ impl Ssa {
         if !chain.is_empty() {
             let v = self.read(s, b, var, init);
             for c in chain {
-                self.write(c, var, v);
+                self.cache(c, var, v);
             }
             return v;
         }
@@ -134,7 +189,7 @@ impl Ssa {
             self.at(b).incomplete.push((var, phi));
             phi
         } else {
-            let preds = self.at(b).preds.clone();
+            let preds = self.preds_of(b, var);
             match preds.len() {
                 0 => init(s, var),
                 1 => self.read(s, preds[0], var, init),
@@ -165,7 +220,7 @@ impl Ssa {
                 }
             }
         };
-        self.write(b, var, v);
+        self.cache(b, var, v);
         v
     }
 

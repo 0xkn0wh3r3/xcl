@@ -269,14 +269,21 @@ impl Lw {
             Some(0) => return Ok(()),
             _ => {}
         }
+        let from = self.cur();
         let then = self.block(None);
         let join = self.block(None);
         self.cond_br(cond, then, join);
         self.seal(then);
         self.s.m.set_block(then);
-        body(self)?;
+        self.ssa.begin_log();
+        let r = body(self);
+        let written = self.ssa.end_log();
+        r?;
+        let end = self.cur();
         self.br(join);
-        self.seal(join);
+        // only what the body wrote merges at the join; other registers read straight
+        // through `from` (no walk through both edges of every guard)
+        self.ssa.seal_region_join(join, from, end, written);
         self.s.m.set_block(join);
         Ok(())
     }
