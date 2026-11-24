@@ -134,6 +134,8 @@ pub enum TexDim {
     D2Array,
     D3,
     Cube,
+    /// Typed buffer (test only): `width` elements of `format`, `height` = `depth` = 1.
+    Buffer,
 }
 
 /// A texture for kernel tests: SRV at heap index 2·i, UAV (if `uav`) at 2·i + 1.
@@ -211,7 +213,19 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             TexDim::D3 => (D3D12_RESOURCE_DIMENSION_TEXTURE3D, t.depth),
             _ => (D3D12_RESOURCE_DIMENSION_TEXTURE2D, t.depth),
         };
-        let rd = D3D12_RESOURCE_DESC {
+        let rd = if t.dim == TexDim::Buffer {
+            D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: (t.width * t.texel_bytes) as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: if t.uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
+                ..Default::default()
+            }
+        } else { D3D12_RESOURCE_DESC {
             Dimension: dim,
             Width: t.width as u64,
             Height: t.height,
@@ -221,7 +235,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Flags: if t.uav { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
             ..Default::default()
-        };
+        } };
         let subs = if t.dim == TexDim::D3 { 1 } else { t.depth };
         let mut fps = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); subs as usize];
         let mut size = 0u64;
@@ -256,7 +270,10 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
         dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r)
             .map_err(e)?;
         let r = r.ok_or("texture")?;
-        for (k, fp) in fps.iter().enumerate() {
+        if t.dim == TexDim::Buffer {
+            list.CopyBufferRegion(&r, 0, upload.as_ref().unwrap(), fps[0].Offset, rd.Width);
+        }
+        for (k, fp) in fps.iter().enumerate().filter(|_| t.dim != TexDim::Buffer) {
             let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 } };
             let src = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: transmute_copy(upload.as_ref().unwrap()),
@@ -293,6 +310,12 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
                 sv.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { MipLevels: 1, NumCubes: t.depth / 6, ..Default::default() };
                 uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
                 uv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV { ArraySize: t.depth, ..Default::default() };
+            }
+            TexDim::Buffer => {
+                sv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                sv.Anonymous.Buffer = D3D12_BUFFER_SRV { NumElements: t.width, ..Default::default() };
+                uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                uv.Anonymous.Buffer = D3D12_BUFFER_UAV { NumElements: t.width, ..Default::default() };
             }
         }
         if !t.uav {
@@ -357,6 +380,13 @@ pub fn wave64_supported() -> Result<bool, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init);
     gpu.as_ref().map(|x| x.wave64).map_err(|x| x.clone())
+}
+
+/// Whether the adapter runs 32-lane waves (`[WaveSize(32)]`).
+pub fn wave32_supported() -> Result<bool, String> {
+    let mut g = GPU.lock().unwrap();
+    let gpu = g.get_or_insert_with(init);
+    gpu.as_ref().map(|x| x.wave32).map_err(|x| x.clone())
 }
 
 /// Whether wave64 programs need the split form here (`Options::split_wave64`): the
@@ -527,7 +557,10 @@ pub fn run_with_statics(
             let (r, fps, size) = &bound.textures[i];
             let rb = buffer(dev, *size, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
             list.ResourceBarrier(&[transition(r, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            for (k, fp) in fps.iter().enumerate() {
+            if t.dim == TexDim::Buffer {
+                list.CopyBufferRegion(&rb, fps[0].Offset, r, 0, (t.width * t.texel_bytes) as u64);
+            }
+            for (k, fp) in fps.iter().enumerate().filter(|_| t.dim != TexDim::Buffer) {
                 let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
                 let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 } };
                 list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
