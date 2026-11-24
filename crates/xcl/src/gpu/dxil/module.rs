@@ -1049,6 +1049,42 @@ impl Module {
             Op::Ret | Op::Unreachable => InstInfo::Term(None, Vec::new()),
         }
     }
+    /// Whether an instruction of the entry function produces or consumes a
+    /// value of type `t` (the shader-flag rules key off instruction types).
+    /// The 64-bit integer and double types, if already interned (lookup
+    /// without adding them to the type table).
+    pub fn existing_i64_f64(&self) -> (Option<Ty>, Option<Ty>) {
+        (self.type_ids.get(&TypeDef::Int(64)).copied(), self.type_ids.get(&TypeDef::Double).copied())
+    }
+    /// Whether the entry uses a D3D11.1 double extension through plain
+    /// instructions: double `fdiv`, or conversions between double and
+    /// integers (DXC's shader-flag rules; `Fma` is flagged by its helper).
+    pub fn uses_double_extensions(&self) -> bool {
+        let Some(f64) = self.type_ids.get(&TypeDef::Double).copied() else { return false };
+        self.insts.iter().any(|d| match &d.op {
+            Op::Bin(BinOp::UDiv | BinOp::SDiv, ..) => d.ty == f64,
+            Op::Cast(CastOp::FPToUI | CastOp::FPToSI, v, _) => self.value_ty(*v) == f64,
+            Op::Cast(CastOp::UIToFP | CastOp::SIToFP, _, t) => *t == f64,
+            _ => false,
+        })
+    }
+    pub fn insts_use_type(&self, t: Ty) -> bool {
+        self.blocks.iter().flatten().any(|&i| {
+            let d = &self.insts[i as usize];
+            if d.ty == t {
+                return true;
+            }
+            let ops: Vec<Value> = match self.inst_info(i) {
+                InstInfo::Call(_, a) => a.to_vec(),
+                InstInfo::Phi(l) => l.iter().map(|p| p.0).collect(),
+                InstInfo::Load(p) => vec![p],
+                InstInfo::Store(p, v) => vec![p, v],
+                InstInfo::Other(v) => v,
+                InstInfo::Term(c, _) => c.into_iter().collect(),
+            };
+            ops.into_iter().any(|v| self.value_ty(v) == t)
+        })
+    }
     /// The integer value of a constant (zero-extended from its width).
     pub fn const_u64(&self, v: Value) -> Option<u64> {
         match v {

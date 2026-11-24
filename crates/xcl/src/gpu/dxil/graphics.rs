@@ -870,6 +870,7 @@ impl Shader {
         if !self.m.terminated() {
             self.m.ret();
         }
+        self.infer_type_features();
         let ins = io.place(Dir::In);
         let outs = io.place(Dir::Out);
         let prims = io.place(Dir::Prim);

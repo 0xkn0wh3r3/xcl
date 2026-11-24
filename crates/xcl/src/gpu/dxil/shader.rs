@@ -423,12 +423,31 @@ impl Shader {
         (Some(node), [cbv, smp, srv, uav].concat())
     }
 
+    /// Requires the features implied by instruction types alone (`Int64Ops`
+    /// for any i64, `Doubles` for any double, `DoubleExtensions` for double
+    /// division and int ↔ double conversions), which the validator derives
+    /// from the code and demands in the flags even when the IR was built
+    /// with [`Module`] methods directly rather than the [`Shader`] helpers.
+    pub(super) fn infer_type_features(&mut self) {
+        let (i64, f64) = self.m.existing_i64_f64();
+        if i64.is_some_and(|t| self.m.insts_use_type(t)) {
+            self.require(Feature::Int64Ops);
+        }
+        if f64.is_some_and(|t| self.m.insts_use_type(t)) {
+            self.require(Feature::Doubles);
+        }
+        if self.m.uses_double_extensions() {
+            self.require(Feature::DoubleExtensions);
+        }
+    }
+
     /// Writes metadata, bitcode and the signed container.
     pub fn finish(mut self, numthreads: [u32; 3], wave_size: Option<u32>) -> Vec<u8> {
         assert_eq!(self.stage, Stage::Compute, "only compute entry points are finished so far");
         if !self.m.terminated() {
             self.m.ret();
         }
+        self.infer_type_features();
         let flags: u64 = self.features.iter().map(|f| f.metadata_bit()).fold(0, |a, b| a | b);
         let sfi0: u64 = self.features.iter().map(|f| f.container_bit()).fold(0, |a, b| a | b);
 
