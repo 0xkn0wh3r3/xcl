@@ -120,6 +120,34 @@ impl Module {
         }
     }
 
+    /// Whether every non-phi operand of the reachable instructions is written before its
+    /// use and has a value (what the writer checks).
+    fn uses_well_formed(&self, order: &[u32]) -> bool {
+        let mut at = vec![usize::MAX; self.insts.len()];
+        let mut k = 0;
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                at[i as usize] = k;
+                k += 1;
+            }
+        }
+        let mut ok = true;
+        for &b in order {
+            for &i in &self.blocks[b as usize] {
+                let op = &self.insts[i as usize].op;
+                if matches!(op, Op::Phi(_)) {
+                    continue;
+                }
+                op.for_each_operand(|v| {
+                    if let Value::Inst(j) = v {
+                        ok &= at[j as usize] < at[i as usize] && !matches!(self.types[self.insts[j as usize].ty.0 as usize], super::TypeDef::Void);
+                    }
+                });
+            }
+        }
+        ok
+    }
+
     /// Immediate dominators of the blocks in `order` (reverse postorder), by
     /// Cooper, Harvey and Kennedy's iteration ("A Simple, Fast Dominance Algorithm").
     fn idoms(&self, order: &[u32]) -> Vec<Option<usize>> {
@@ -130,7 +158,7 @@ impl Module {
         }
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
         for &b in order {
-            for s in self.succs(b as usize) {
+            for s in self.successors(b as usize) {
                 preds[s.0 as usize].push(b as usize);
             }
         }
@@ -178,7 +206,12 @@ impl Module {
     pub fn optimize(&mut self) {
         let off = std::env::var("XCL_DXIL_NO_OPT").unwrap_or_default();
         let skip = |p: &str| off.split(',').any(|x| x.trim() == p || x.trim() == "all");
-        let order = self.block_order();
+        let order: Vec<u32> = self.block_layout().0.into_iter().map(|b| b as u32).collect();
+        // malformed IR (a use before its definition or of a void result) is left for the
+        // writer to report, not cleaned away
+        if !self.uses_well_formed(&order) {
+            return;
+        }
         // unreachable blocks: emptied (the writer drops them)
         let mut reach = vec![false; self.blocks.len()];
         for &b in &order {

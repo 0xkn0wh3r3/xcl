@@ -51,7 +51,35 @@ fn blob(bytes: &[u8]) -> Result<IDxcBlob, String> {
     }
 }
 
+/// The validator version our metadata declares (`dx.valver`). It stays 1.8 rather than
+/// 1.7: the PSV0 part carries `PSVRuntimeInfo3` (the entry name), which validator 1.8
+/// introduced, so a 1.7 validator would reject the container anyway.
+pub const VALVER: (u32, u32) = (1, 8);
+
+/// The loaded validator's version (`IDxcVersionInfo`), queried once.
+pub fn validator_version() -> Result<(u32, u32), String> {
+    static V: std::sync::OnceLock<Result<(u32, u32), String>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let v: IDxcValidator = instance(compiler_create()?, &CLSID_DxcValidator)?;
+        let info: IDxcVersionInfo = v.cast().map_err(|e| format!("IDxcVersionInfo: {e}"))?;
+        let (mut major, mut minor) = (0, 0);
+        unsafe { info.GetVersion(&mut major, &mut minor) }.map_err(|e| format!("GetVersion: {e}"))?;
+        Ok((major, minor))
+    })
+    .clone()
+}
+
+/// Whether the loaded validator can check our containers (version >= [`VALVER`]). The
+/// Windows SDK's DXC 1.7, for one, cannot: it rejects `dx.valver` 1.8 before anything else.
+pub fn validator_supported() -> bool {
+    validator_version().is_ok_and(|v| v >= VALVER)
+}
+
 /// Validates a container with DXC's validator; `Err` carries the validator's messages.
+///
+/// With a validator older than [`VALVER`] the check is skipped (`Ok`, and under test a
+/// `SKIPPED <test>: validator <ver> < 1.8` line once per test): emitted shaders do not need
+/// the validator at run time, and the GPU tests still run. Malformed containers still fail.
 pub fn validate(container: &[u8]) -> Result<(), String> {
     let v: IDxcValidator = instance(compiler_create()?, &CLSID_DxcValidator)?;
     let b = blob(container)?;
@@ -62,8 +90,31 @@ pub fn validate(container: &[u8]) -> Result<(), String> {
             return Ok(());
         }
         let msg = error_text(r.GetErrorBuffer());
+        if !validator_supported() && msg.contains("Validator version in metadata") {
+            skip_validation();
+            return Ok(());
+        }
         Err(if msg.is_empty() { format!("validation failed: {status:?}") } else { msg })
     }
+}
+
+/// Reports (once per test thread, under test) that validation was skipped for an old validator.
+pub fn skip_validation() {
+    if !cfg!(test) {
+        return;
+    }
+    use std::io::Write;
+    let thread = std::thread::current();
+    // Only test threads (`module::test`), not e.g. the translator's worker threads.
+    if !thread.name().is_some_and(|n| n.contains("::")) {
+        return;
+    }
+    thread_local!(static REPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    if REPORTED.with(|r| r.replace(true)) {
+        return;
+    }
+    let (major, minor) = validator_version().unwrap_or_default();
+    let _ = writeln!(std::io::stderr(), "SKIPPED {}: validator {major}.{minor} < {}.{} (validation step only)", thread.name().unwrap_or("?"), VALVER.0, VALVER.1);
 }
 
 /// DXC's textual disassembly of a container (for diagnostics and tests).

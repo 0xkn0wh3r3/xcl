@@ -120,9 +120,9 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         split_wave64,
         cache_dir: dxc::cache_dir(),
     };
-    // the direct DXIL translator's output stays out of the on-disk cache (keyed for the HLSL path)
-    let direct = crate::gpu::dxil::kernel::enabled();
-    let from_disk = || if direct { compile_one() } else { translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one) };
+    // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
+    // direct translator version, routing mode): never mixed with the HLSL path's entries
+    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
     cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
@@ -151,6 +151,46 @@ mod translated {
         h | 1
     }
 
+    /// The backend producing an entry: the HLSL path, or `XCL_DIRECT_DXIL` routing (whose
+    /// results may also be HLSL fallbacks, so its identity extends the HLSL one).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Backend {
+        Hlsl,
+        /// direct DXIL for compute + the mesh pass (`=1`)
+        DirectCompute,
+        /// direct DXIL for VS / PS too (`=all`)
+        DirectAll,
+    }
+
+    impl Backend {
+        pub(super) fn current() -> Self {
+            match (crate::gpu::dxil::kernel::enabled(), crate::gpu::dxil::kernel::enabled_graphics()) {
+                (_, true) => Backend::DirectAll,
+                (true, false) => Backend::DirectCompute,
+                _ => Backend::Hlsl,
+            }
+        }
+    }
+
+    /// `identity_for` of `backend`: unchanged for the HLSL path (its entries stay valid),
+    /// tagged with the direct translator's version and routing mode otherwise.
+    pub(super) fn identity_with(source: &str, toolchain: &str, backend: Backend, direct_version: u32) -> u64 {
+        let base = identity_for(source, toolchain);
+        let tag = match backend {
+            Backend::Hlsl => return base,
+            Backend::DirectCompute => "compute",
+            Backend::DirectAll => "all",
+        };
+        let mut h = base;
+        for part in ["xcl-direct-dxil", tag, &direct_version.to_string()] {
+            for byte in part.bytes().chain([0]) {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        h | 1
+    }
+
     /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
     /// Zero means the disk cache is disabled.
     fn identity() -> u64 {
@@ -159,7 +199,12 @@ mod translated {
             if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
                 return 0;
             }
-            identity_for(env!("XCL_TRANSLATOR_SOURCE_ID"), super::dxc::toolchain_identity())
+            identity_with(
+                env!("XCL_TRANSLATOR_SOURCE_ID"),
+                super::dxc::toolchain_identity(),
+                Backend::current(),
+                crate::gpu::dxil::kernel::TRANSLATOR_VERSION,
+            )
         })
     }
 
@@ -844,6 +889,61 @@ mod shader_cache_tests {
 
         let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || panic!("v2 entry was not reused")).unwrap();
         assert_eq!(second.dxil, first.dxil);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Direct DXIL entries have their own identity per routing mode and translator version;
+    /// the HLSL identity is the pre-direct one (its entries stay valid).
+    #[test]
+    fn direct_dxil_identity_never_collides_with_hlsl() {
+        use translated::{identity_for, identity_with, Backend};
+        let hlsl = identity_with("s", "t", Backend::Hlsl, 1);
+        assert_eq!(hlsl, identity_for("s", "t"));
+        assert_eq!(hlsl, identity_with("s", "t", Backend::Hlsl, 2), "the direct version does not touch HLSL entries");
+        let ids = [
+            hlsl,
+            identity_with("s", "t", Backend::DirectCompute, 1),
+            identity_with("s", "t", Backend::DirectAll, 1),
+            identity_with("s", "t", Backend::DirectCompute, 2),
+            identity_with("s2", "t", Backend::DirectCompute, 1),
+            identity_with("s", "t2", Backend::DirectCompute, 1),
+        ];
+        assert!(ids.iter().all(|&i| i != 0));
+        assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len());
+    }
+
+    /// Hit / miss through a temp cache dir: a direct entry is reused by the same identity and
+    /// is a miss for the HLSL identity (and the other way round) for the same request.
+    #[test]
+    fn direct_and_hlsl_disk_entries_are_separate() {
+        use translated::{cached_in, identity_with, Backend};
+        let dir = std::env::temp_dir().join(format!("xcl-translated-direct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"console-direct";
+        let hlsl = identity_with("s", "t", Backend::Hlsl, 1);
+        let direct = identity_with("s", "t", Backend::DirectCompute, 1);
+        let go = |ident, marker: u8, calls: &mut u32| {
+            cached_in(&dir, ident, blob, Stage::Compute, 0, 1, true, || {
+                *calls += 1;
+                Ok(compiled(marker))
+            })
+            .unwrap()
+            .dxil[0]
+        };
+        let mut calls = 0;
+        assert_eq!(go(direct, 1, &mut calls), 1);
+        assert_eq!(go(direct, 9, &mut calls), 1, "direct hit");
+        assert_eq!(calls, 1);
+        assert_eq!(go(hlsl, 2, &mut calls), 2, "HLSL misses the direct entry");
+        assert_eq!(calls, 2);
+        assert_eq!(go(hlsl, 9, &mut calls), 2, "HLSL hit");
+        assert_eq!(go(direct, 9, &mut calls), 1, "direct entry not overwritten");
+        assert_eq!(calls, 2);
+        let v2 = identity_with("s", "t", Backend::DirectCompute, 2);
+        assert_eq!(go(v2, 3, &mut calls), 3, "a version bump misses");
+        // another split_wave64 / sampler base is another entry
+        let other = cached_in(&dir, direct, blob, Stage::Compute, 0, 1, false, || Ok(compiled(4))).unwrap();
+        assert_eq!(other.dxil[0], 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -254,6 +254,8 @@ pub struct Module {
     md: Vec<MdDef>,
     named_md: Vec<(String, Vec<Md>)>,
     md_strings: HashMap<String, Md>,
+    /// The first misuse of the builder (see [`Module::error`]); later ones are dropped.
+    error: std::cell::RefCell<Option<String>>,
 }
 
 impl Default for Module {
@@ -278,7 +280,24 @@ impl Module {
             md: Vec::new(),
             named_md: Vec::new(),
             md_strings: HashMap::new(),
+            error: std::cell::RefCell::new(None),
         }
+    }
+
+    // ---- errors
+
+    /// Records a misuse of the builder (the first one is kept). The builder carries on with a
+    /// placeholder so callers need no error paths; [`Module::try_to_bitcode`] (and the
+    /// `Shader::try_finish*` methods) then fail with this message instead of emitting.
+    pub fn fail(&self, msg: impl Into<String>) {
+        let mut e = self.error.borrow_mut();
+        if e.is_none() {
+            *e = Some(msg.into());
+        }
+    }
+    /// The first recorded builder error, if any.
+    pub fn error(&self) -> Option<String> {
+        self.error.borrow().clone()
     }
 
     // ---- types
@@ -347,18 +366,28 @@ impl Module {
             _ => None,
         }
     }
-    fn struct_elem(&self, t: Ty, i: u32) -> Ty {
-        match &self.types[t.0 as usize] {
-            TypeDef::Struct(_, e) => e[i as usize],
-            TypeDef::Array(_, e) => *e,
-            other => panic!("extractvalue from {other:?}"),
+    fn struct_elem(&mut self, t: Ty, i: u32) -> Ty {
+        let r = match &self.types[t.0 as usize] {
+            TypeDef::Struct(_, e) => e.get(i as usize).copied(),
+            TypeDef::Array(_, e) => Some(*e),
+            _ => None,
+        };
+        r.unwrap_or_else(|| {
+            self.fail(format!("extractvalue {i} from {:?}", self.types[t.0 as usize]));
+            self.i32()
+        })
+    }
+    fn pointee_of(&self, t: Ty) -> Option<(Ty, u32)> {
+        match self.types[t.0 as usize] {
+            TypeDef::Ptr(p, a) => Some((p, a)),
+            _ => None,
         }
     }
-    fn pointee(&self, t: Ty) -> (Ty, u32) {
-        match self.types[t.0 as usize] {
-            TypeDef::Ptr(p, a) => (p, a),
-            ref other => panic!("not a pointer: {other:?}"),
-        }
+    fn pointee(&mut self, t: Ty) -> (Ty, u32) {
+        self.pointee_of(t).unwrap_or_else(|| {
+            self.fail(format!("not a pointer: {:?}", self.types[t.0 as usize]));
+            (self.i32(), 0)
+        })
     }
 
     // ---- constants
@@ -374,7 +403,10 @@ impl Module {
     }
     /// An integer constant; `v` is truncated / sign-extended to the type's width.
     pub fn const_int(&mut self, ty: Ty, v: u64) -> Value {
-        let w = self.int_width(ty).expect("const_int of a non-integer type");
+        let w = self.int_width(ty).unwrap_or_else(|| {
+            self.fail(format!("const_int of {:?}", self.types[ty.0 as usize]));
+            64
+        });
         let sext = if w >= 64 { v as i64 } else { ((v << (64 - w)) as i64) >> (64 - w) };
         self.constant(ConstDef::Int(ty, sext))
     }
@@ -402,7 +434,10 @@ impl Module {
             TypeDef::Half => bits & 0xFFFF,
             TypeDef::Float => bits & 0xFFFF_FFFF,
             TypeDef::Double => bits,
-            ref other => panic!("const_float of {other:?}"),
+            ref other => {
+                self.fail(format!("const_float of {other:?}"));
+                bits
+            }
         };
         self.constant(ConstDef::Float(ty, bits))
     }
@@ -421,7 +456,9 @@ impl Module {
     /// Declares (or finds) a function by name.
     pub fn declare(&mut self, name: &str, ty: Ty, attrs: FnAttrs) -> u32 {
         if let Some(&f) = self.func_ids.get(name) {
-            assert_eq!(self.funcs[f as usize].ty, ty, "function {name} redeclared with another type");
+            if self.funcs[f as usize].ty != ty {
+                self.fail(format!("function {name} redeclared with another type"));
+            }
             return f;
         }
         let f = self.funcs.len() as u32;
@@ -436,7 +473,9 @@ impl Module {
         let v = self.void();
         let ty = self.func_ty(v, &[]);
         let f = self.declare(name, ty, FnAttrs::None);
-        assert!(self.funcs.iter().all(|f| !f.defined), "only one defined function");
+        if self.funcs.iter().any(|f| f.defined) {
+            self.fail(format!("a second defined function ({name})"));
+        }
         self.funcs[f as usize].defined = true;
         f
     }
@@ -490,7 +529,9 @@ impl Module {
     }
 
     fn push(&mut self, op: Op, ty: Ty) -> Value {
-        assert!(!self.terminated(), "instruction after a terminator in block {:?}", self.cur);
+        if self.terminated() {
+            self.fail(format!("instruction after a terminator in block {:?}", self.cur));
+        }
         let id = self.insts.len() as u32;
         self.insts.push(InstDef { op, ty });
         self.blocks[self.cur.0 as usize].push(id);
@@ -542,10 +583,16 @@ impl Module {
     pub fn call(&mut self, f: u32, args: &[Value]) -> Value {
         let ret = match &self.types[self.funcs[f as usize].ty.0 as usize] {
             TypeDef::Func(r, p) => {
-                assert_eq!(p.len(), args.len(), "call to {} with {} arguments", self.funcs[f as usize].name, args.len());
-                *r
+                let r = *r;
+                if p.len() != args.len() {
+                    self.fail(format!("call to {} with {} arguments", self.funcs[f as usize].name, args.len()));
+                }
+                r
             }
-            _ => unreachable!(),
+            _ => {
+                self.fail(format!("call to {}, not a function type", self.funcs[f as usize].name));
+                self.void()
+            }
         };
         self.push(Op::Call(f, args.to_vec()), ret)
     }
@@ -589,11 +636,13 @@ impl Module {
         }
     }
     pub fn add_incoming(&mut self, phi: Value, v: Value, from: Block) {
-        let Value::Inst(i) = phi else { panic!("not a phi") };
-        match &mut self.insts[i as usize].op {
-            Op::Phi(list) => list.push((v, from)),
-            _ => panic!("not a phi"),
+        if let Value::Inst(i) = phi {
+            if let Op::Phi(list) = &mut self.insts[i as usize].op {
+                list.push((v, from));
+                return;
+            }
         }
+        self.fail(format!("add_incoming to a non-phi {phi:?}"));
     }
     pub fn load(&mut self, ptr: Value, align: u32) -> Value {
         let pt = self.type_of(ptr);
@@ -611,7 +660,10 @@ impl Module {
         for _ in 1..idx.len() {
             t = match &self.types[t.0 as usize] {
                 TypeDef::Array(_, e) => *e,
-                other => panic!("gep into {other:?}"),
+                other => {
+                    self.fail(format!("gep into {other:?}"));
+                    break;
+                }
             };
         }
         let rt = self.ptr(t, space);
@@ -698,22 +750,36 @@ impl Module {
 
     // ---------------------------------------------------- serialisation
 
-    /// The module as LLVM 3.7 bitcode (`BC\xC0\xDE` …).
+    /// [`Module::to_bitcode`], or the first builder error (recorded while building or
+    /// found while writing, e.g. a forward reference outside a phi).
+    pub fn try_to_bitcode(&mut self, triple: &str, datalayout: &str) -> Result<Vec<u8>, String> {
+        if let Some(e) = self.error() {
+            return Err(e);
+        }
+        let b = self.write_bitcode(triple, datalayout);
+        match self.error() {
+            Some(e) => Err(e),
+            None => Ok(b),
+        }
+    }
+
+    /// The module as LLVM 3.7 bitcode (`BC\xC0\xDE` …). Panics on a builder error
+    /// (recorded or found while writing); [`Module::try_to_bitcode`] reports it instead.
     pub fn to_bitcode(&mut self, triple: &str, datalayout: &str) -> Vec<u8> {
+        self.try_to_bitcode(triple, datalayout).unwrap_or_else(|e| panic!("DXIL builder: {e}"))
+    }
+
+    fn write_bitcode(&mut self, triple: &str, datalayout: &str) -> Vec<u8> {
         // Every type the writer references must exist before the type table:
         // pointers to the declared functions (call / metadata operands).
         for f in 0..self.funcs.len() {
             self.type_of(Value::Func(f as u32));
         }
 
-        // Blocks are written in reverse postorder from the entry (a block after every block
-        // dominating it, so operands are defined before use whatever order the blocks were
-        // created in); unreachable blocks are dropped.
-        let order = self.block_order();
-        let mut block_pos: Vec<Option<u32>> = vec![None; self.blocks.len()];
-        for (k, &b) in order.iter().enumerate() {
-            block_pos[b as usize] = Some(k as u32);
-        }
+        // Blocks are written in reverse post-order of the entry's CFG (entry
+        // first), so a lowering may create blocks in any order; unreachable blocks
+        // are dropped. Value numbering follows that order.
+        let (order, pos) = self.block_layout();
 
         // Global variables nothing references (e.g. an exchange array the code never
         // needed) are left out: the validator rejects unused internal declarations.
@@ -727,7 +793,7 @@ impl Module {
                 _ => {}
             };
             for &b in &order {
-                for &i in &self.blocks[b as usize] {
+                for &i in &self.blocks[b] {
                     let op = &self.insts[i as usize].op;
                     if let Op::Call(f, _) = op {
                         mark(Value::Func(*f));
@@ -773,7 +839,7 @@ impl Module {
         {
             let mut next = inst_base;
             for &b in &order {
-                for &i in &self.blocks[b as usize] {
+                for &i in &self.blocks[b] {
                     if !self.is_void(self.insts[i as usize].ty) {
                         inst_ids[i as usize] = Some(next);
                         next += 1;
@@ -786,7 +852,10 @@ impl Module {
                 Value::Global(g) => gmap[g as usize].expect("use of a dropped global"),
                 Value::Func(f) => n_globals + fmap[f as usize].expect("use of a dropped function"),
                 Value::Const(c) => const_base + c as u64,
-                Value::Inst(i) => inst_ids[i as usize].expect("use of a void instruction"),
+                Value::Inst(i) => inst_ids[i as usize].unwrap_or_else(|| {
+                    self.fail(format!("use of a void instruction %{i}"));
+                    0
+                }),
             }
         };
 
@@ -901,9 +970,7 @@ impl Module {
         w.enter_block(BLOCK_FUNCTION);
         w.record(FUNC_CODE_DECLAREBLOCKS, &[order.len() as u64]);
         let mut inst_id = inst_base;
-        let pos = |b: Block| block_pos[b.0 as usize];
         for &b in &order {
-            let b = b as usize;
             for k in 0..self.blocks[b].len() {
                 let i = self.blocks[b][k] as usize;
                 self.write_inst(&mut w, i, inst_id, &abs, &pos);
@@ -957,8 +1024,8 @@ impl Module {
         w.end_block();
     }
 
-    /// Successor blocks of `b` (from its terminator).
-    fn succs(&self, b: usize) -> Vec<Block> {
+    /// Successor blocks of block `b` (from its terminator, if any).
+    fn successors(&self, b: usize) -> Vec<Block> {
         match self.blocks[b].last().map(|&i| &self.insts[i as usize].op) {
             Some(Op::Br(t)) => vec![*t],
             Some(Op::CondBr(_, t, f)) => vec![*t, *f],
@@ -967,39 +1034,103 @@ impl Module {
         }
     }
 
-    /// The blocks reachable from the entry, in reverse postorder (iterative DFS).
-    fn block_order(&self) -> Vec<u32> {
+    /// The written block order (reverse post-order from the entry block, which
+    /// keeps the creation order where that is already a valid layout) and each
+    /// block's position in it (`None`: unreachable, not written).
+    fn block_layout(&self) -> (Vec<usize>, Vec<Option<u32>>) {
         let n = self.blocks.len();
         let mut seen = vec![false; n];
         let mut post = Vec::with_capacity(n);
-        let mut stack: Vec<(usize, Vec<Block>, usize)> = vec![(0, self.succs(0), 0)];
+        // Iterative DFS; successors pushed so that earlier-created ones are visited
+        // last, which makes the reverse post-order prefer creation order.
+        let mut stack: Vec<(usize, Vec<Block>)> = vec![(0, {
+            let mut s = self.successors(0);
+            s.sort_by_key(|b| std::cmp::Reverse(b.0));
+            s
+        })];
         seen[0] = true;
-        while let Some((b, succ, k)) = stack.last_mut() {
-            if let Some(&s) = succ.get(*k) {
-                *k += 1;
-                let s = s.0 as usize;
-                if !seen[s] {
-                    seen[s] = true;
-                    let ss = self.succs(s);
-                    stack.push((s, ss, 0));
+        while let Some((b, succ)) = stack.last_mut() {
+            match succ.pop() {
+                Some(t) => {
+                    let t = t.0 as usize;
+                    if t < n && !seen[t] {
+                        seen[t] = true;
+                        let mut s = self.successors(t);
+                        s.sort_by_key(|b| std::cmp::Reverse(b.0));
+                        stack.push((t, s));
+                    }
                 }
-            } else {
-                post.push(*b as u32);
-                stack.pop();
+                None => {
+                    post.push(*b);
+                    stack.pop();
+                }
             }
         }
         post.reverse();
-        post
+        let mut pos = vec![None; n];
+        for (k, &b) in post.iter().enumerate() {
+            pos[b] = Some(k as u32);
+        }
+        (post, pos)
     }
 
-    fn write_inst(&self, w: &mut BitWriter, i: usize, inst_id: u64, abs: &dyn Fn(Value) -> u64, pos: &dyn Fn(Block) -> Option<u32>) {
+    /// Replaces every use of `old` by `new` in the entry's instructions and in
+    /// metadata (e.g. to drop a trivial phi). `old` itself stays in its block.
+    pub fn replace_all_uses(&mut self, old: Value, new: Value) {
+        let r = |v: &mut Value| {
+            if *v == old {
+                *v = new;
+            }
+        };
+        for inst in &mut self.insts {
+            match &mut inst.op {
+                Op::Bin(_, a, b, _) | Op::Cmp(_, a, b) | Op::Store(a, b, _) | Op::AtomicRmw(_, a, b) => {
+                    r(a);
+                    r(b)
+                }
+                Op::Cast(_, a, _) | Op::Extract(a, _) | Op::Load(a, _) | Op::CondBr(a, _, _) | Op::Alloca(_, a, _) => r(a),
+                Op::Select(a, b, c) | Op::CmpXchg(a, b, c) => {
+                    r(a);
+                    r(b);
+                    r(c)
+                }
+                Op::Call(_, args) => args.iter_mut().for_each(r),
+                Op::Phi(inc) => inc.iter_mut().for_each(|(v, _)| r(v)),
+                Op::Gep(p, idx) => {
+                    r(p);
+                    idx.iter_mut().for_each(r)
+                }
+                Op::Switch(v, _, cases) => {
+                    r(v);
+                    cases.iter_mut().for_each(|(c, _)| r(c))
+                }
+                Op::Br(_) | Op::Ret | Op::Unreachable => {}
+            }
+        }
+        for m in &mut self.md {
+            if let MdDef::Val(_, v) = m {
+                r(v);
+            }
+        }
+    }
+
+    fn write_inst(&self, w: &mut BitWriter, i: usize, inst_id: u64, abs: &dyn Fn(Value) -> u64, pos: &[Option<u32>]) {
         // Relative operand; forward references are only legal in phis.
         let rel = |v: Value| -> u64 {
             let a = abs(v);
-            assert!(a < inst_id, "forward reference to value {a} at instruction {inst_id} (blocks must be in dominance order)");
+            if a >= inst_id {
+                self.fail(format!("forward reference to value {a} at instruction {inst_id} (blocks must be in dominance order)"));
+                return 1;
+            }
             inst_id - a
         };
-        let bb = |b: Block| pos(b).expect("branch to an unreachable block") as u64;
+        let bb = |b: Block| match pos.get(b.0 as usize).copied().flatten() {
+            Some(p) => p as u64,
+            None => {
+                self.fail(format!("branch to missing block {}", b.0));
+                0
+            }
+        };
         match &self.insts[i].op {
             Op::Bin(op, a, b, flags) => {
                 let mut ops = vec![rel(*a), rel(*b), *op as u64];
@@ -1020,8 +1151,8 @@ impl Module {
             }
             Op::Phi(inc) => {
                 let mut ops = vec![self.insts[i].ty.0 as u64];
-                // edges from unreachable (dropped) blocks go with them
-                for &(v, b) in inc.iter().filter(|(_, b)| pos(*b).is_some()) {
+                // incoming edges from unreachable (unwritten) blocks are dropped
+                for &(v, b) in inc.iter().filter(|(_, b)| pos.get(b.0 as usize).copied().flatten().is_some()) {
                     ops.push(signed(inst_id as i64 - abs(v) as i64));
                     ops.push(bb(b));
                 }
@@ -1037,7 +1168,7 @@ impl Module {
             }
             Op::Gep(p, idx) => {
                 let pt = self.value_ty(*p);
-                let (src, _) = self.pointee(pt);
+                let (src, _) = self.pointee_of(pt).unwrap_or((pt, 0));
                 let mut ops = vec![1, src.0 as u64, rel(*p)];
                 ops.extend(idx.iter().map(|&v| rel(v)));
                 w.record(FUNC_CODE_INST_GEP, &ops)
@@ -1265,11 +1396,21 @@ impl Module {
         let pt = self.type_of(ptr);
         let (mut t, space) = self.pointee(pt);
         for &i in &idx[1..] {
-            t = match &self.types[t.0 as usize] {
-                TypeDef::Array(_, e) => *e,
-                TypeDef::Struct(_, f) => f[self.const_u64(i).expect("constant struct field index") as usize],
-                other => panic!("gep into {other:?}"),
+            let next = match &self.types[t.0 as usize] {
+                TypeDef::Array(_, e) => Ok(*e),
+                TypeDef::Struct(_, f) => self
+                    .const_u64(i)
+                    .and_then(|k| f.get(k as usize).copied())
+                    .ok_or_else(|| format!("gep: struct field {i:?} of {:?}", self.types[t.0 as usize])),
+                other => Err(format!("gep into {other:?}")),
             };
+            match next {
+                Ok(n) => t = n,
+                Err(e) => {
+                    self.fail(e);
+                    break;
+                }
+            }
         }
         let rt = self.ptr(t, space);
         self.push(Op::Gep(ptr, idx.to_vec()), rt)

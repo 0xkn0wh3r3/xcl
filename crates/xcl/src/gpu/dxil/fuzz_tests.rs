@@ -733,7 +733,16 @@ impl Emit<'_> {
                 let init = self.s.m.bin(BinOp::Xor, init, kc);
                 self.s.gs_store(g, idx, init);
                 self.s.barrier(barrier::GROUP_SYNC);
-                self.s.gs_atomic(*op, g, idx, v);
+                // `atomicrmw sub` as an add of the negation, the form DXC and the translator
+                // emit: NVIDIA Blackwell drivers refuse pipelines with a groupshared
+                // `atomicrmw sub` (CreateComputePipelineState E_OUTOFMEMORY).
+                let (op, v) = if *op == RmwOp::Sub {
+                    let zero = self.s.m.i32c(0);
+                    (RmwOp::Add, self.s.m.bin(BinOp::Sub, zero, v))
+                } else {
+                    (*op, v)
+                };
+                self.s.gs_atomic(op, g, idx, v);
                 let eight = self.s.m.i32c(8);
                 self.s.gs_cmpxchg(g, eight, v, init);
                 self.s.barrier(barrier::GROUP_SYNC);
@@ -1155,7 +1164,7 @@ fn run_seeds(range: std::ops::Range<u64>, gpu_every: u64) -> (usize, usize) {
         check_valid(seed, &c);
         if gpu && p.gpu_safe && seed % gpu_every == 0 {
             let mem = inputs(seed);
-            let r = runner::run_with(&c, &runner::KernelState::default(), &mem, &[], &[]).unwrap_or_else(|e| panic!("seed {seed}: GPU run: {e}"));
+            let r = runner::run_with(&c, &runner::KernelState::default(), &mem, &[], &[]).unwrap_or_else(|e| panic!("seed {seed}: GPU run ({} bytes, {} instructions): {e}", c.len(), instructions(&c)));
             for (i, v) in interpret(&p, &mem) {
                 if r.raw[i] != v {
                     let dis = validate::disassemble(&c).unwrap_or_else(|d| d);
@@ -1168,6 +1177,11 @@ fn run_seeds(range: std::ops::Range<u64>, gpu_every: u64) -> (usize, usize) {
     }
     eprintln!("fuzz seeds {range:?}: validated {}, GPU-compared {ran} (digest tails < 56 / >= 56: {tails:?})", range.clone().count());
     (range.count(), ran)
+}
+
+/// Instructions in the module's disassembly (for failure reports).
+fn instructions(c: &[u8]) -> usize {
+    validate::disassemble(c).map(|d| d.lines().filter(|l| l.starts_with("  ") && !l.trim_start().starts_with(';')).count()).unwrap_or(0)
 }
 
 #[test]
@@ -1195,6 +1209,17 @@ fn debug_seed() {
     let c = emit(&p);
     println!("{}", validate::disassemble(&c).unwrap());
     println!("{:?}", validate::validate(&c));
+    println!("seed {seed}: {} bytes, {} instructions, gpu_safe {}", c.len(), instructions(&c), p.gpu_safe);
+    if p.gpu_safe && matches!(runner::wave32_supported(), Ok(true)) {
+        let mem = inputs(seed);
+        match runner::run_with(&c, &runner::KernelState::default(), &mem, &[], &[]) {
+            Ok(r) => {
+                let bad = interpret(&p, &mem).into_iter().filter(|&(i, v)| r.raw[i] != v).count();
+                println!("GPU run: {bad} mismatching results");
+            }
+            Err(e) => println!("GPU run: {e}"),
+        }
+    }
 }
 
 /// Regression: i64 / double instructions built with plain [`super::module::Module`]

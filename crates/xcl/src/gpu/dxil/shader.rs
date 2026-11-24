@@ -172,6 +172,9 @@ impl Shader {
         for &a in args {
             params.push(self.m.type_of(a));
         }
+        if let Some(want) = dxc_fn_attrs(op) {
+            debug_assert_eq!(attrs, want, "dx.op {op} ({name}) attributes differ from DXC's");
+        }
         let fty = self.m.func_ty(ret, &params);
         let f = self.m.declare(&full, fty, attrs);
         let opc = self.m.i32c(op);
@@ -198,7 +201,8 @@ impl Shader {
         } else if t == self.m.i8() {
             "i8"
         } else {
-            panic!("no dx.op overload suffix for type {t:?}")
+            self.m.fail(format!("no dx.op overload suffix for type {t:?}"));
+            "i32"
         }
     }
 
@@ -306,7 +310,9 @@ impl Shader {
 
     /// `rawBufferStore` of up to four 32-bit values at byte `offset`.
     pub fn raw_store(&mut self, buf: RawUav, offset: Value, vals: &[Value]) {
-        assert!((1..=4).contains(&vals.len()));
+        if !(1..=4).contains(&vals.len()) {
+            return self.m.fail(format!("rawBufferStore of {} values", vals.len()));
+        }
         let i32 = self.m.i32();
         let void = self.m.void();
         let undef = self.m.undef(i32);
@@ -332,7 +338,7 @@ impl Shader {
     pub fn wave_lane_index(&mut self) -> Value {
         self.require(Feature::WaveOps);
         let i32 = self.m.i32();
-        self.op(111, "waveGetLaneIndex", None, i32, &[], FnAttrs::ReadNone)
+        self.op(111, "waveGetLaneIndex", None, i32, &[], FnAttrs::ReadOnly)
     }
     /// `WaveActiveBallot` → four i32 words (lanes 0-31, 32-63, …).
     pub fn wave_ballot(&mut self, cond: Value) -> [Value; 4] {
@@ -454,9 +460,17 @@ impl Shader {
         }
     }
 
-    /// Writes metadata, bitcode and the signed container.
-    pub fn finish(mut self, numthreads: [u32; 3], wave_size: Option<u32>) -> Vec<u8> {
-        assert_eq!(self.stage, Stage::Compute, "only compute entry points are finished so far");
+    /// Writes metadata, bitcode and the signed container (panics on a builder error: tests;
+    /// translators use [`Shader::try_finish`]).
+    pub fn finish(self, numthreads: [u32; 3], wave_size: Option<u32>) -> Vec<u8> {
+        self.try_finish(numthreads, wave_size).unwrap_or_else(|e| panic!("DXIL builder: {e}"))
+    }
+
+    /// [`Shader::finish`], or the first builder error.
+    pub fn try_finish(mut self, numthreads: [u32; 3], wave_size: Option<u32>) -> Result<Vec<u8>, String> {
+        if self.stage != Stage::Compute {
+            return Err(format!("finish of a {:?} entry (only compute; graphics use finish_graphics)", self.stage));
+        }
         if !self.m.terminated() {
             self.m.ret();
         }
@@ -469,7 +483,7 @@ impl Shader {
         let one = m.md_i32(1);
         let ver = m.md_i32(self.sm.1);
         let dx_version = m.md_node(&[Some(one), Some(ver)]);
-        let valver = m.md_i32(8);
+        let valver = m.md_i32(super::validate::VALVER.1);
         let dx_valver = m.md_node(&[Some(one), Some(valver)]);
         let prefix = m.md_str(self.stage.profile_prefix());
         let smaj = m.md_i32(self.sm.0);
@@ -501,6 +515,11 @@ impl Shader {
         let name = m.md_str("main");
         let entry = m.md_node(&[Some(fmd), Some(name), None, resources, Some(props_node)]);
 
+        // `!llvm.ident`, as DXC writes first: AMD's driver compiler (amdxc64) crashes at
+        // PSO creation on modules without it.
+        let ident = m.md_str("xcl");
+        let ident = m.md_node(&[Some(ident)]);
+        m.named_md("llvm.ident", &[ident]);
         m.named_md("dx.version", &[dx_version]);
         m.named_md("dx.valver", &[dx_valver]);
         m.named_md("dx.shaderModel", &[shader_model]);
@@ -509,9 +528,50 @@ impl Shader {
         }
         m.named_md("dx.entryPoints", &[entry]);
 
-        let bitcode = m.to_bitcode(TRIPLE, DATALAYOUT);
+        let bitcode = m.try_to_bitcode(TRIPLE, DATALAYOUT)?;
         let (min_wave, max_wave) = wave_size.map_or((0, u32::MAX), |w| (w, w));
         let psv = Psv { stage: self.stage, min_wave, max_wave, numthreads, resources: psv_res, entry: "main".into() };
-        container::container(self.stage, self.sm, &bitcode, sfi0, &psv)
+        Ok(container::container(self.stage, self.sm, &bitcode, sfi0, &psv))
     }
+}
+
+/// The function attributes DXC gives each `dx.op` declaration (DXC 1.9
+/// `DxilOperations.cpp`, checked against `dxc -Fc` listings). AMD's compiler
+/// is sensitive to them (e.g. `waveGetLaneIndex` must be `readonly`), so
+/// [`Shader::op`] checks every declaration against this table in debug
+/// builds. `None` for opcodes not listed.
+pub fn dxc_fn_attrs(op: u32) -> Option<FnAttrs> {
+    use FnAttrs::*;
+    Some(match op {
+        4 => ReadNone,                         // loadInput
+        5 => NoUnwind,                         // storeOutput
+        6..=56 => ReadNone,                    // unary/binary/tertiary/quaternary/dot
+        57..=66 => ReadOnly,                   // createHandle, cbuffer loads, samples, textureLoad
+        67 => NoUnwind,                        // textureStore
+        68 => ReadOnly,                        // bufferLoad
+        69 | 70 => NoUnwind,                   // bufferStore, bufferUpdateCounter
+        71..=77 => ReadOnly,                   // checkAccess, getDimensions, gathers, sample positions
+        78 | 79 => NoUnwind,                   // atomics
+        80 => NoDuplicate,                     // barrier
+        81 => ReadOnly,                        // calculateLOD
+        82 => NoUnwind,                        // discard
+        83..=96 => ReadNone,                   // derivatives, eval*, sampleIndex, coverage, ids
+        97..=99 => NoUnwind,                   // emitStream, cutStream, emitThenCutStream
+        100..=102 => ReadNone,                 // gsInstanceID, makeDouble, splitDouble
+        110 => NoUnwind,                       // waveIsFirstLane
+        111 => ReadOnly,                       // waveGetLaneIndex
+        112 => ReadNone,                       // waveGetLaneCount
+        113..=123 => NoUnwind,                 // wave / quad ops
+        124..=132 => ReadNone,                 // bitcasts, legacy conversions
+        135 | 136 => NoUnwind,                 // waveAllOp, wavePrefixBitCount
+        137 | 138 => ReadNone,                 // attributeAtVertex, viewID
+        139 => ReadOnly,                       // rawBufferLoad
+        140 => NoUnwind,                       // rawBufferStore
+        165..=169 => NoUnwind,                 // waveMatch, waveMultiPrefix*, mesh outputs
+        170 => ReadOnly,                       // getMeshPayload
+        171 | 172 => NoUnwind,                 // storeVertexOutput, storePrimitiveOutput
+        216..=218 => ReadNone,                 // annotateHandle, createHandleFromBinding/Heap
+        221 => ReadOnly,                       // isHelperLane
+        _ => return Option::None,
+    })
 }

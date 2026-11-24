@@ -199,8 +199,7 @@ impl Lw {
                 let e = ext_encoding(d).ok_or_else(|| format!("{}: DPP", rdna2::format(d)))?;
                 let fv = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
                 let v = self.vreg(fv("VSRC0"));
-                let el = self.sreg(126);
-                let eh = if self.wave64 { self.sreg(127) } else { self.c(0) };
+                let (el, eh) = self.exec_mask();
                 let t;
                 if d.variant == Variant::Dpp16 {
                     let ctrl = fv("DPP_CTRL");
@@ -969,8 +968,7 @@ impl Lw {
                 };
                 let l = self.or(base, row);
                 let l = self.or(l, nsel);
-                let el = self.sreg(126);
-                let eh = if self.wave64 { self.sreg(127) } else { self.c(0) };
+                let (el, eh) = self.exec_mask();
                 let on = self.lanebit_at(el, eh, l);
                 let fib = self.b(fi);
                 let ok = self.lor(fib, on);
@@ -982,8 +980,7 @@ impl Lw {
                 }
             }
             "v_readfirstlane_b32" => {
-                let el = self.sreg(126);
-                let eh = if self.wave64 { self.sreg(127) } else { self.c(0) };
+                let (el, eh) = self.exec_mask();
                 let l = self.first_lane(el, eh);
                 let t = self.read_lane_uniform(a, l);
                 self.write32(&dst, t);

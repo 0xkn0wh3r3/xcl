@@ -924,11 +924,19 @@ fn dep_table(deps: &Deps, dir: u8, n_in: u32, n_out: u32) -> Vec<u32> {
 impl Shader {
     /// Writes metadata, bitcode and the signed container for a vertex,
     /// pixel or mesh entry point with the I/O declared in `io`.
-    pub fn finish_graphics(mut self, io: GraphicsIo, info: StageInfo) -> Vec<u8> {
-        assert_eq!(self.stage, io.stage);
+    /// Panics on a builder error (tests; translators use [`Shader::try_finish_graphics`]).
+    pub fn finish_graphics(self, io: GraphicsIo, info: StageInfo) -> Vec<u8> {
+        self.try_finish_graphics(io, info).unwrap_or_else(|e| panic!("DXIL builder: {e}"))
+    }
+
+    /// [`Shader::finish_graphics`], or the first builder error.
+    pub fn try_finish_graphics(mut self, io: GraphicsIo, info: StageInfo) -> Result<Vec<u8>, String> {
+        if self.stage != io.stage {
+            return Err(format!("{:?} shader with {:?} I/O", self.stage, io.stage));
+        }
         match (self.stage, info) {
             (Stage::Vertex, StageInfo::Vertex) | (Stage::Pixel, StageInfo::Pixel { .. }) | (Stage::Mesh, StageInfo::Mesh { .. }) => {}
-            (st, i) => panic!("stage {st:?} with {i:?}"),
+            (st, i) => return Err(format!("stage {st:?} with {i:?}")),
         }
         if !self.m.terminated() {
             self.m.ret();
@@ -979,7 +987,7 @@ impl Shader {
         let one = m.md_i32(1);
         let ver = m.md_i32(sm.1);
         let dx_version = m.md_node(&[Some(one), Some(ver)]);
-        let valver = m.md_i32(8);
+        let valver = m.md_i32(super::validate::VALVER.1);
         let dx_valver = m.md_node(&[Some(one), Some(valver)]);
         let prefix = m.md_str(stage.profile_prefix());
         let smaj = m.md_i32(sm.0);
@@ -1069,6 +1077,11 @@ impl Shader {
         let name = m.md_str("main");
         let entry = m.md_node(&[Some(fmd), Some(name), sigs, resources, props_node]);
 
+        // `!llvm.ident`, as DXC writes first: AMD's driver compiler (amdxc64) crashes at
+        // PSO creation on modules without it.
+        let ident = m.md_str("xcl");
+        let ident = m.md_node(&[Some(ident)]);
+        m.named_md("llvm.ident", &[ident]);
         m.named_md("dx.version", &[dx_version]);
         m.named_md("dx.valver", &[dx_valver]);
         m.named_md("dx.shaderModel", &[shader_model]);
@@ -1077,7 +1090,7 @@ impl Shader {
         }
         m.named_md("dx.viewIdState", &[view_id]);
         m.named_md("dx.entryPoints", &[entry]);
-        let bitcode = m.to_bitcode(TRIPLE, if native16 { DATALAYOUT_NATIVE16 } else { DATALAYOUT });
+        let bitcode = m.try_to_bitcode(TRIPLE, if native16 { DATALAYOUT_NATIVE16 } else { DATALAYOUT })?;
 
         // PSV0.
         let (iv, ov, pv) = (vectors(&ins), vectors(&outs), vectors(&prims));
@@ -1123,10 +1136,10 @@ impl Shader {
         };
         let psg = if stage == Stage::Mesh { Some(sig_part(&prims, true, native16)) } else { None };
         let (isg, osg) = (sig_part(&ins, false, native16), sig_part(&outs, true, native16));
-        container::container_with_signatures(stage, sm, &bitcode, sfi0, isg, osg, psg, container::psv_part_full(&psv))
+        Ok(container::container_with_signatures(stage, sm, &bitcode, sfi0, isg, osg, psg, container::psv_part_full(&psv)))
     }
 }
 
 #[cfg(test)]
 #[path = "graphics_tests.rs"]
-mod tests;
+pub(in crate::gpu::dxil) mod tests;

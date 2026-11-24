@@ -8,7 +8,7 @@ use super::shader::Shader;
 use super::validate;
 use crate::gpu::recomp::runner;
 
-/// The program of `testdata/dxc_cs_raw_uav.hlsl`, emitted directly:
+/// The program of `tests/data/dxil/dxc_cs_raw_uav.hlsl`, emitted directly:
 /// `a = io[lane]; f = asfloat(a) * 2 + 1; if (a > 5) f = -f;
 ///  res[lane] = asuint(f) + WaveReadLaneAt(a, 3)` — with a real branch and phi
 /// rather than a select, to exercise control flow.
@@ -109,4 +109,71 @@ fn emitted_kernel_runs_on_the_gpu() {
     let state = runner::KernelState { sgpr: sgpr.clone(), vgpr: vec![vec![0; 256]; 64], scc: 0 };
     let r = runner::run(&c, &state, &[]).expect("GPU run");
     assert_eq!(&r.raw[..64], &expected(&sgpr, wave as usize)[..]);
+}
+
+/// Blocks created out of dominance order (a block used as a branch target
+/// before the block that dominates it exists), an unreachable block feeding a
+/// phi, and `replace_all_uses` on a trivial phi: the writer lays blocks out in
+/// reverse post-order, drops the unreachable one and its phi edge, and the
+/// result validates and runs (res[lane] = (lane << 2) + 7 + io[lane]).
+fn out_of_order_kernel() -> Vec<u8> {
+    let mut s = Shader::new(Stage::Compute, (6, 6));
+    let io = s.raw_uav(0, 0);
+    let res = s.raw_uav(1, 0);
+    let lane = s.thread_id_in_group(0);
+    let two = s.m.i32c(2);
+    let off = s.m.bin(BinOp::Shl, lane, two);
+    let entry = s.m.current_block();
+    // created first, reached last
+    let tail = s.m.new_block();
+    let dead = s.m.new_block();
+    let mid = s.m.new_block();
+    s.m.br(mid);
+
+    s.m.set_block(mid);
+    let seven = s.m.i32c(7);
+    let v = s.m.bin(BinOp::Add, off, seven);
+    let x = s.raw_load(io, off, 1)[0];
+    s.m.br(tail);
+
+    s.m.set_block(dead);
+    let junk = s.m.i32c(0xdead);
+    s.m.br(tail);
+
+    s.m.set_block(tail);
+    let i32 = s.m.i32();
+    let trivial = s.m.phi(i32); // only ever `v`: replaced below
+    s.m.add_incoming(trivial, v, mid);
+    let p = s.m.phi(i32);
+    s.m.add_incoming(p, x, mid);
+    s.m.add_incoming(p, junk, dead);
+    let sum = s.m.bin(BinOp::Add, trivial, p);
+    s.raw_store(res, off, &[sum]);
+    s.m.replace_all_uses(trivial, v);
+    let _ = entry;
+    s.finish([64, 1, 1], None)
+}
+
+#[test]
+fn blocks_are_written_in_reverse_post_order() {
+    let c = out_of_order_kernel();
+    if let Err(e) = validate::validate(&c) {
+        let dis = validate::disassemble(&c).unwrap_or_else(|d| d);
+        panic!("validator rejected the out-of-order kernel:\n{e}\n--- disassembly ---\n{dis}");
+    }
+    let dis = validate::disassemble(&c).expect("disassembly");
+    assert!(!dis.contains("57005"), "the unreachable block's constant must be gone:\n{dis}");
+    match runner::wave32_supported().or_else(|_| runner::wave64_supported()) {
+        Ok(true) => {}
+        Ok(false) => return runner::skip_test("no wave32 / wave64"),
+        Err(e) => return runner::skip_test(&e),
+    }
+    let mut sgpr = vec![0u32; 128];
+    for (l, v) in sgpr.iter_mut().take(64).enumerate() {
+        *v = 1000 + l as u32 * 3;
+    }
+    let state = runner::KernelState { sgpr: sgpr.clone(), vgpr: vec![vec![0; 256]; 64], scc: 0 };
+    let r = runner::run(&c, &state, &[]).expect("GPU run");
+    let want: Vec<u32> = (0..64).map(|l| ((l as u32) << 2) + 7 + sgpr[l]).collect();
+    assert_eq!(&r.raw[..64], &want[..]);
 }

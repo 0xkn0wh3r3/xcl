@@ -730,6 +730,17 @@ fn texture_variants_validate() {
 
 // ------------------------------------------------------------------- wave
 
+/// `WaveGetLaneIndex` is declared as DXC 1.9 declares it.
+#[test]
+fn wave_lane_index_is_declared_readonly() {
+    let mut k = kernel();
+    let lane = k.s.wave_lane_index();
+    k.out(0, lane);
+    let dis = validate::disassemble(&k.finish([32, 1, 1])).expect("disassembly");
+    let at = dis.lines().position(|l| l.starts_with("declare i32 @dx.op.waveGetLaneIndex(")).expect("the declaration");
+    assert_eq!(dis.lines().nth(at - 1), Some("; Function Attrs: nounwind readonly"), "{dis}");
+}
+
 #[test]
 fn wave_ops_match_cpu() {
     let mut k = kernel();
@@ -765,7 +776,7 @@ fn wave_ops_match_cpu() {
     let mask = k.s.wave_match(key);
     o.push(mask[0]);
     o.push(k.s.wave_multi_prefix_op(u, mask, multi_prefix::SUM, true));
-    o.push(k.s.wave_multi_prefix_op(u, mask, multi_prefix::XOR, true));
+    o.push(k.s.wave_multi_prefix_op(u, mask, multi_prefix::XOR, false));
     o.push(k.s.wave_multi_prefix_bit_count(gt3, mask));
     let u64v = k.s.m.cast(CastOp::ZExt, u, i64);
     let sh = k.s.m.const_int(i64, 8);
@@ -907,6 +918,9 @@ fn f32_to_f16(x: f32, rtz: bool) -> u16 {
 
 #[test]
 fn double_unary_legality_matches_dxil_tables() {
+    if !validate::validator_supported() {
+        return validate::skip_validation();
+    }
     // Which float unary ops take an f64 overload (DXIL.rst: FAbs, Saturate only).
     let all = [
         FUnary::FAbs, FUnary::Saturate, FUnary::Cos, FUnary::Sin, FUnary::Exp, FUnary::Frc, FUnary::Log, FUnary::Sqrt, FUnary::Rsqrt, FUnary::RoundNe,
@@ -1038,7 +1052,11 @@ fn half_precision_overloads_run() {
     let mad = k.s.tertiary(Tertiary::FMad, ha, hb, ab);
     // (f16 isSpecialFloat needs SM 6.9.)
     let nan = k.s.fclass(FClass::IsNaN, a);
-    let sum = k.s.wave_active_op(ab, WaveOp::Max, false);
+    // Reduce `ha`, not `ab`: AMD's driver (RDNA4, 32.0.3xxxx) drops an
+    // `FAbs.f16` feeding `WaveActiveMax.f16` (it returns max(y), 5.0, for
+    // max(|y|), 10.5); DXC's own DXIL for the HLSL does the same. `ab` is
+    // checked on its own above.
+    let sum = k.s.wave_active_op(ha, WaveOp::Max, false);
     for (i, v) in [mx, fl, ab, mad, sum].into_iter().enumerate() {
         let e = k.s.m.cast(CastOp::FPExt, v, f32);
         k.out(i as u32, e);
@@ -1048,7 +1066,7 @@ fn half_precision_overloads_run() {
     let xs: Vec<f32> = (0..32).map(|l| l as f32 * 0.75 - 9.0).collect();
     let ys: Vec<f32> = (0..32).map(|l| 5.0 - l as f32 * 0.5).collect();
     let Some(r) = gpu(&c, &mem_of(&[xs.iter().map(|f| f.to_bits()).collect(), ys.iter().map(|f| f.to_bits()).collect()]), &[], &[]) else { return };
-    let ymax = ys.iter().fold(0f32, |m, y| m.max(y.abs()));
+    let xmax = xs.iter().fold(f32::MIN, |m, &x| m.max(x));
     for l in 0..32 {
         let (x, y) = (xs[l], ys[l]); // all exactly representable in f16
         let got = |i: usize| f32::from_bits(outv(&r, i)[l]);
@@ -1056,7 +1074,41 @@ fn half_precision_overloads_run() {
         assert_eq!(got(1), x.floor());
         assert_eq!(got(2), y.abs());
         assert!((got(3) - (x * y + y.abs())).abs() <= 0.05, "half mad {x} {y}: {}", got(3));
-        assert_eq!(got(4), ymax);
+        assert_eq!(got(4), xmax, "half wave max");
         assert_eq!(outv(&r, 5)[l], 0);
     }
+}
+
+/// Every literal `op(<opcode>, "<name>", .., FnAttrs::<X>)` in the backend
+/// declares the attributes DXC uses for that opcode (table in
+/// `shader::dxc_fn_attrs`, from DXC 1.9 `-Fc` listings).
+#[test]
+fn dx_op_attrs_match_dxc() {
+    use super::module::FnAttrs;
+    let srcs = [include_str!("ops.rs"), include_str!("graphics.rs"), include_str!("lower_image.rs"), include_str!("shader.rs")];
+    let mut n = 0;
+    for src in srcs {
+        for (i, _) in src.match_indices("op(") {
+            let rest = &src[i + 3..];
+            let Some((num, rest)) = rest.split_once(", \"") else { continue };
+            let Ok(op) = num.trim().parse::<u32>() else { continue };
+            let Some(end) = rest.find(')') .and_then(|_| rest.find("FnAttrs::")) else { continue };
+            if rest[..end].contains(';') {
+                continue;
+            }
+            let a = &rest[end + 9..];
+            let a: String = a.chars().take_while(|c| c.is_alphanumeric()).collect();
+            let got = match a.as_str() {
+                "ReadNone" => FnAttrs::ReadNone,
+                "ReadOnly" => FnAttrs::ReadOnly,
+                "NoUnwind" => FnAttrs::NoUnwind,
+                "NoDuplicate" => FnAttrs::NoDuplicate,
+                _ => FnAttrs::None,
+            };
+            let want = super::shader::dxc_fn_attrs(op).unwrap_or_else(|| panic!("opcode {op} missing from dxc_fn_attrs"));
+            assert_eq!(got, want, "opcode {op}: {}", &rest[..rest.find('"').unwrap_or(0)]);
+            n += 1;
+        }
+    }
+    assert!(n > 50, "only {n} declarations found");
 }

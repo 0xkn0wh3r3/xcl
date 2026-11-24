@@ -32,6 +32,11 @@ pub struct KernelOptions {
     pub sampler_base: u32,
 }
 
+/// Version of the direct translator's output, part of the on-disk translation cache's
+/// identity (`recomp::pso`): bump it on any change that alters the emitted containers
+/// (the `gpu/dxil` sources are not in build.rs's translator source hash).
+pub const TRANSLATOR_VERSION: u32 = 3;
+
 /// `XCL_DIRECT_DXIL=1`: console compute shaders (and the kernel tests) go through this
 /// translator, with the HLSL path as the fallback for what it cannot translate yet.
 pub fn enabled() -> bool {
@@ -173,6 +178,8 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         gfx: None,
         gfx_half: None,
         whole_live: Default::default(),
+        guard_override: None,
+        mask_override: None,
         exchange_error: None,
         pc: 0,
     };
@@ -326,6 +333,11 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     }
     lw.s.m.set_block(exit);
     lw.seal(exit);
+    // the epilogue uses values of the program's blocks, which were created after `exit`: it goes
+    // into a block of its own after them (only a phi may refer to a later block's value)
+    let tail = lw.block(Some(1));
+    lw.br(tail);
+    lw.s.m.set_block(tail);
     if let (Some(res), true) = (res, kernel) {
         store_registers(&mut lw, res);
     }
@@ -340,12 +352,13 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     }
     let hw = if split || !o.wave64 { 32 } else { 64 };
     let c = if gfx {
-        let g = lw.gfx.take().expect("graphics entry");
+        let g = lw.gfx.take().ok_or("graphics entry without graphics I/O")?;
         let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
-        lw.s.finish_graphics(g.io, info)
+        lw.s.try_finish_graphics(g.io, info)
     } else {
-        lw.s.finish(numthreads, Some(hw))
-    };
+        lw.s.try_finish(numthreads, Some(hw))
+    }
+    .map_err(|e| format!("direct DXIL builder error: {e}"))?;
     if cfg!(any(test, debug_assertions)) {
         if let Err(e) = super::validate::validate(&c) {
             let dis = super::validate::disassemble(&c).unwrap_or_else(|d| d);
