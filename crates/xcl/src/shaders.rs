@@ -1156,6 +1156,48 @@ mod pipeline_cap_tests {
         // not a number: the default, not a crash
         assert_eq!(pipeline_cap_kb(Some("off")), 8192);
     }
+
+    #[test]
+    fn stale_blob_cannot_bypass_the_offline_pipeline_cap() {
+        use super::{Pipelines, recomp, Ordering};
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        if let Err(reason) = recomp::dxc::location() {
+            recomp::runner::skip_test(&format!("no DXC: {reason}"));
+            return;
+        }
+        let mut pipelines = match Pipelines::new() {
+            Ok(pipelines) => pipelines,
+            Err(reason) => {
+                recomp::runner::skip_test(&format!("no D3D12 device: {reason}"));
+                return;
+            }
+        };
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("xcl-stale-pso-{}-{nonce}", std::process::id())));
+        std::fs::create_dir(&scratch.0).expect("scratch cache directory");
+        let hlsl = "RWByteAddressBuffer mem : register(u2); [numthreads(1,1,1)] void main() { mem.Store(0, 42); }";
+        let dxil = recomp::dxc::compile(hlsl, "main", "cs_6_6", &[]).expect("DXC compile");
+        let path = scratch.0.join("stale.pso");
+        std::fs::write(&path, b"deliberately invalid cached PSO").expect("stale blob");
+
+        pipelines.max_dxil = dxil.len() - 1;
+        let start = Instant::now();
+        pipelines.make_with_cache_path(&recomp::pso::Compiled { dxil: dxil.clone(), samplers: vec![] }, Some(path.clone()));
+        let elapsed = start.elapsed();
+        let capped = pipelines.capped.load(Ordering::Relaxed);
+        let made = pipelines.made.load(Ordering::Relaxed);
+        let refused = pipelines.refused.load(Ordering::Relaxed);
+        let output = recomp::runner::dispatch(&dxil, [1, 1, 1], &[], &[0; 64]).expect("runtime GPU dispatch");
+        println!("adapter={} dxil_bytes={} offline_ms={} capped={} made={} refused={} gpu_word0={}", recomp::runner::adapter().unwrap_or_default(), dxil.len(), elapsed.as_millis(), capped, made, refused, output[0]);
+        assert_eq!(output[0], 42);
+        assert_eq!((capped, made, refused), (1, 0, 0));
+        assert!(!path.exists(), "rejected blob should not be retried next run");
+    }
 }
 
 // D3D12 devices and root signatures are free-threaded
@@ -1178,6 +1220,10 @@ impl Pipelines {
 
     /// The compute pipeline of `c` (made and released).
     fn make(&self, c: &recomp::pso::Compiled) {
+        self.make_with_cache_path(c, None);
+    }
+
+    fn make_with_cache_path(&self, c: &recomp::pso::Compiled, path_override: Option<PathBuf>) {
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
         let rs = {
@@ -1202,12 +1248,13 @@ impl Pipelines {
             ..Default::default()
         };
         use crate::hle::d3d12x::real::driver_cache;
-        let path = driver_cache::path(&c.dxil, desc.Flags.0);
+        let path = path_override.or_else(|| driver_cache::path(&c.dxil, desc.Flags.0));
         let cached = path.as_deref().and_then(driver_cache::load);
+        let over_cap = self.max_dxil != 0 && c.dxil.len() > self.max_dxil;
         // over the cap and no blob from an earlier run: the driver's compile of this one takes
         // tens of minutes and gigabytes; the pass finishes without it, and the runtime builds it
         // when a title needs the pipeline. `XCL_PIPELINE_MAX_KB` 0 turns the cap off.
-        if cached.is_none() && self.max_dxil != 0 && c.dxil.len() > self.max_dxil {
+        if cached.is_none() && over_cap {
             self.capped.fetch_add(1, Ordering::Relaxed);
             self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
             drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
@@ -1222,8 +1269,25 @@ impl Pipelines {
         }
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
-            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }.ok()
+            // a driver that cannot use the blob may compile from the DXIL itself and still
+            // return Ok: only the pipeline carrying a blob of the size we handed over is a hit
+            unsafe { self.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) }
+                .ok()
+                .filter(|pso| unsafe { pso.GetCachedBlob() }.is_ok_and(|b| unsafe { b.GetBufferSize() } == bytes.len()))
         });
+        // A stale blob is not a usable cache hit. Do not let its presence bypass the offline
+        // size cap and start the expensive uncached driver compile.
+        if cached.is_some() && from_cache.is_none() && over_cap {
+            if let Some(path) = path.as_deref() {
+                let _ = std::fs::remove_file(path);
+            }
+            *self.running.0.lock().unwrap() -= 1;
+            self.running.1.notify_one();
+            self.capped.fetch_add(1, Ordering::Relaxed);
+            self.capped_bytes.fetch_add(c.dxil.len(), Ordering::Relaxed);
+            drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+            return;
+        }
         let r = if let Some(pso) = from_cache {
             self.reused.fetch_add(1, Ordering::Relaxed);
             Ok(pso)
