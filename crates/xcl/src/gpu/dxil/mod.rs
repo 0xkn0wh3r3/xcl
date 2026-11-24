@@ -45,6 +45,8 @@ mod bitreader_tests;
 #[cfg(test)]
 mod robustness_tests;
 #[cfg(test)]
+mod fuzz_tests;
+#[cfg(test)]
 mod msaa_tests;
 #[cfg(test)]
 mod round_tests;
