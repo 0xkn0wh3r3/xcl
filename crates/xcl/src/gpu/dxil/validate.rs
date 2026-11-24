@@ -81,6 +81,7 @@ pub fn validator_supported() -> bool {
 /// `SKIPPED <test>: validator <ver> < 1.8` line once per test): emitted shaders do not need
 /// the validator at run time, and the GPU tests still run. Malformed containers still fail.
 pub fn validate(container: &[u8]) -> Result<(), String> {
+    header_fits(container)?;
     let v: IDxcValidator = instance(compiler_create()?, &CLSID_DxcValidator)?;
     let b = blob(container)?;
     unsafe {
@@ -117,8 +118,19 @@ pub fn skip_validation() {
     let _ = writeln!(std::io::stderr(), "SKIPPED {}: validator {major}.{minor} < {}.{} (validation step only)", thread.name().unwrap_or("?"), VALVER.0, VALVER.1);
 }
 
+/// Refuses input shorter than a container header (32 bytes) before DXC sees it: DXC 1.8's
+/// validator (dxcompiler 1.8.2502.11, the Windows SDK's) reads the whole header of a blob
+/// that starts with `DXBC`, past the end of a shorter one (`b"DXBC"` faults in it).
+fn header_fits(container: &[u8]) -> Result<(), String> {
+    if container.len() < 32 {
+        return Err(format!("not a DXIL container: {} bytes, shorter than its 32-byte header", container.len()));
+    }
+    Ok(())
+}
+
 /// DXC's textual disassembly of a container (for diagnostics and tests).
 pub fn disassemble(container: &[u8]) -> Result<String, String> {
+    header_fits(container)?;
     let c: IDxcCompiler3 = instance(compiler_create()?, &CLSID_DxcCompiler)?;
     let buf = DxcBuffer { Ptr: container.as_ptr() as *const c_void, Size: container.len(), Encoding: 0 };
     unsafe {
