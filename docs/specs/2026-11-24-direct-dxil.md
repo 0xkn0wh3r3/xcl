@@ -101,10 +101,18 @@ in scratch memory. The direct backend therefore uses a per-lane model:
 | Phase | Content | Exit criterion |
 |---|---|---|
 | 0 ✅ | Bitstream, module, DXIL layer, container + hash, validator oracle, GPU smoke test | Emitted kernel validates and runs |
-| 1 | SSA + per-lane model for straight-line and branchy **compute kernels in the test ABI**; SALU/VALU integer + float ALU | Differential tests pass for ALU instruction tests |
-| 2 | Memory: `buffer_*`/`tbuffer_*`/`s_load`/`s_buffer_load`/flat/global, LDS (`ds_*` → groupshared), atomics | Memory instruction tests pass |
-| 3 | Cross-lane: DPP16/DPP8, `v_readlane`/`v_writelane`, permlane, whole-wave regions | Cross-lane tests pass, wave64 on wave32 |
-| 4 | Real compute shaders: resource tracing → heap/root bindings; `XCL_DIRECT_DXIL=1` live routing with fallback | Corpus CS coverage measured, live title runs |
-| 5 | Graphics: VS/PS signatures (`ISG1`/`OSG1`/PSV elements), interpolation, exports, images/samplers | VS/PS tests and live draws |
-| 6 | Mesh/two-pass pipelines, mesh output metadata | Mesh tests |
+| 1 ✅ | SSA + per-lane model for straight-line and branchy **compute kernels in the test ABI**; SALU/VALU integer + float ALU | Differential tests pass for ALU instruction tests |
+| 2 ✅ | Memory: `buffer_*`/`tbuffer_*`/`s_load`/`s_buffer_load`/flat/global, LDS (`ds_*` → groupshared), atomics | Memory instruction tests pass |
+| 3 ✅ | Cross-lane: DPP16/DPP8, `v_readlane`/`v_writelane`, permlane, whole-wave regions | Cross-lane tests pass, wave64 on wave32 |
+| 4 (partial) | Real compute shaders: resource tracing → heap/root bindings; `XCL_DIRECT_DXIL=1` live routing with fallback | Corpus CS coverage measured, live title runs |
+| 5 (partial) | Graphics: VS/PS signatures (`ISG1`/`OSG1`/PSV elements), interpolation, exports, images/samplers | VS/PS tests and live draws |
+| 6 (partial) | Mesh/two-pass pipelines, mesh output metadata | Mesh tests |
 | 7 | Default-on for covered shaders, cache keying on backend version | Parity with the HLSL path |
+
+Status (main-based port, 2026-11-24): phases 1–3 done; 4–6 partial — live routing
+behind `XCL_DIRECT_DXIL=1` (compute + mesh compute pass) / `=all` (VS/PS) with a
+logged HLSL fallback is in, corpus coverage and live-title runs are not measured
+yet. Model: a faithful EXEC/ballot model (EXEC and VCC as wave masks, lanes
+predicated per instruction over a structured block CFG); per-lane
+structurization (real divergent control flow instead of predication) is future
+work. Details: `direct-dxil-progress-core.md`.
