@@ -268,7 +268,8 @@ unsafe extern "system" fn Ret_Void(_t: *mut NullObj) {}
 /// called the C++ way (this, buffer) or the C way (buffer, this) as a retail game calls device
 /// #26 (`real::this_first`): the object is the one whose first word is a vtable made here.
 unsafe fn this_and_ret(a: *mut c_void, b: *mut c_void) -> (*mut NullObj, *mut u8) {
-    let ours = |p: *mut c_void| !p.is_null() && TABLES.lock().unwrap().iter().any(|&(_, v)| v == *(p as *const usize));
+    // (unaligned: the buffer of a 20-byte struct is aligned to 4)
+    let ours = |p: *mut c_void| !p.is_null() && TABLES.lock().unwrap().iter().any(|&(_, v)| v == (p as *const usize).read_unaligned());
     if ours(b) && !ours(a) {
         (b as *mut NullObj, a as *mut u8)
     } else {
@@ -846,11 +847,14 @@ mod tests {
             assert_eq!(D3D12CreateDevice(std::ptr::null_mut(), 0xC100, std::ptr::null(), &mut dev), S_OK);
             let vtbl = *(dev as *const usize);
             let heap_properties: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32) -> *mut c_void = std::mem::transmute(slot(dev, 26));
-            let (mut c, mut cpp) = ([!0u32; 5], [!0u32; 5]);
-            assert_eq!(heap_properties(c.as_mut_ptr() as *mut c_void, dev, 1, 2), c.as_mut_ptr() as *mut c_void);
+            // the C way's buffer 4 past a multiple of 8, where a 20-byte struct's can be
+            let mut store = [!0u64; 4];
+            let c = (store.as_mut_ptr() as *mut u32).add(1) as *mut [u32; 5];
+            let mut cpp = [!0u32; 5];
+            assert_eq!(heap_properties(c as *mut c_void, dev, 1, 2), c as *mut c_void);
             assert_eq!(*(dev as *const usize), vtbl, "the device's vtable pointer");
             heap_properties(dev, cpp.as_mut_ptr() as *mut c_void, 1, 2);
-            assert_eq!((c, c[0]), (cpp, 4));
+            assert_eq!((*c, (*c)[0]), (cpp, 4));
             // one that reads its object: resource #10 GetDesc
             let mut desc = [0u8; 56];
             desc[0] = 1; // BUFFER
