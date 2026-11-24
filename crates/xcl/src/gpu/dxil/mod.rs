@@ -25,3 +25,5 @@ mod tests;
 mod ops_tests;
 #[cfg(test)]
 mod bitreader_tests;
+#[cfg(test)]
+mod fuzz_tests;
