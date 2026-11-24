@@ -37,7 +37,7 @@ placement, otherwise DXC packing). Ops: `load_input` (PS `SV_SampleIndex`
 `is_helper_lane`, `set_mesh_output_counts`, `emit_indices` (2 or 3),
 `store_vertex_output`, `store_primitive_output`, `mesh_payload`.
 
-## Rules learned from DXC 1.9 output (NCSA; references in `testdata/`)
+## Rules learned from DXC 1.9 output (NCSA; references in `tests/data/dxil/`)
 
 - **Packing** (default prefix-stable): elements in declaration order, first
   fit from row 0, column 0. A row holds one interpolation mode; columns fill

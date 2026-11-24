@@ -8,7 +8,7 @@ use super::shader::Shader;
 use super::validate;
 use crate::gpu::recomp::runner;
 
-/// The program of `testdata/dxc_cs_raw_uav.hlsl`, emitted directly:
+/// The program of `tests/data/dxil/dxc_cs_raw_uav.hlsl`, emitted directly:
 /// `a = io[lane]; f = asfloat(a) * 2 + 1; if (a > 5) f = -f;
 ///  res[lane] = asuint(f) + WaveReadLaneAt(a, 3)` — with a real branch and phi
 /// rather than a select, to exercise control flow.

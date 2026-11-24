@@ -48,6 +48,6 @@ V = DXC validator, G = GPU run on RTX 4090 (wave32) vs CPU reference.
 
 - Static SRVs (`srv_raw/structured/typed/texture`), CBVs (`cbv`, `heap_cbv`,
   `cbuffer_load_legacy` op 59) and samplers (`sampler`, incl. comparison):
-  PSV0/SFI0 byte-checked against `testdata/dxc_{cs,ps}_resources.dxil`.
+  PSV0/SFI0 byte-checked against `tests/data/dxil/dxc_{cs,ps}_resources.dxil`.
 - Pixel-shader derivative / implicit-LOD validation waits for graphics entry points.
 - `SampleCmpLevel` (SM 6.7), `TextureGatherRaw`, `CheckAccessFullyMapped` status are not wrapped.

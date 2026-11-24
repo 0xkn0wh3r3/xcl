@@ -19,7 +19,7 @@ XCL is GPL-2.0-only. References used:
 
 - LLVM 3.7 bitcode format and DXC (`DxilOperations`, `DXIL.rst`, the
   container hash) — University of Illinois/NCSA, GPL-compatible.
-- DXC's *output* for small HLSL test programs (`testdata/`), dumped with a
+- DXC's *output* for small HLSL test programs (`tests/data/dxil/`), dumped with a
   local bitstream reader, as the layout oracle.
 - Mesa `src/microsoft/compiler` (MIT) may be ported with a provenance note.
 
