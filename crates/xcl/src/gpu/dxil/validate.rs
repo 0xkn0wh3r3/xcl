@@ -28,15 +28,25 @@ fn instance<T: Interface>(create: CreateInstance, clsid: &windows::core::GUID) -
 
 fn blob_text(b: &IDxcBlob) -> String {
     unsafe {
-        let s = std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize());
-        String::from_utf8_lossy(s).trim_end_matches('\0').to_string()
+        let (p, n) = (b.GetBufferPointer() as *const u8, b.GetBufferSize());
+        // An empty blob may have a null buffer, which `from_raw_parts` forbids.
+        if p.is_null() || n == 0 {
+            return String::new();
+        }
+        String::from_utf8_lossy(std::slice::from_raw_parts(p, n)).trim_end_matches('\0').to_string()
     }
+}
+
+/// The text of an operation's error buffer (empty if there is none).
+fn error_text(e: windows::core::Result<IDxcBlobEncoding>) -> String {
+    e.ok().and_then(|e| e.cast::<IDxcBlob>().ok()).map(|b| blob_text(&b)).unwrap_or_default()
 }
 
 fn blob(bytes: &[u8]) -> Result<IDxcBlob, String> {
     let utils: IDxcUtils = instance(compiler_create()?, &CLSID_DxcUtils)?;
     unsafe {
-        let b = utils.CreateBlob(bytes.as_ptr() as *const c_void, bytes.len() as u32, DXC_CP_ACP).map_err(|e| format!("CreateBlob: {e}"))?;
+        let len = u32::try_from(bytes.len()).map_err(|_| "blob larger than 4 GiB".to_string())?;
+        let b = utils.CreateBlob(bytes.as_ptr() as *const c_void, len, DXC_CP_ACP).map_err(|e| format!("CreateBlob: {e}"))?;
         b.cast::<IDxcBlob>().map_err(|e| format!("{e}"))
     }
 }
@@ -51,7 +61,7 @@ pub fn validate(container: &[u8]) -> Result<(), String> {
         if status.is_ok() {
             return Ok(());
         }
-        let msg = r.GetErrorBuffer().ok().map(|e| blob_text(&e.cast::<IDxcBlob>().unwrap())).unwrap_or_default();
+        let msg = error_text(r.GetErrorBuffer());
         Err(if msg.is_empty() { format!("validation failed: {status:?}") } else { msg })
     }
 }
@@ -64,10 +74,33 @@ pub fn disassemble(container: &[u8]) -> Result<String, String> {
         let r: IDxcResult = c.Disassemble(&buf).map_err(|e| format!("Disassemble: {e}"))?;
         let status = r.GetStatus().map_err(|e| format!("{e}"))?;
         if status.is_err() {
-            let msg = r.GetErrorBuffer().ok().map(|e| blob_text(&e.cast::<IDxcBlob>().unwrap())).unwrap_or_default();
+            let msg = error_text(r.GetErrorBuffer());
             return Err(format!("disassembly failed: {msg}"));
         }
         let out: IDxcBlob = r.GetResult().map_err(|e| format!("{e}"))?;
         Ok(blob_text(&out))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Malformed input must come back as `Err`, never as a panic or UB in the
+    /// FFI glue (empty error blobs may carry a null buffer pointer).
+    #[test]
+    fn malformed_containers_are_errors() {
+        let s = super::super::shader::Shader::new(super::super::container::Stage::Compute, (6, 6));
+        let good = s.finish([1, 1, 1], None);
+        assert_eq!(super::validate(&good), Ok(()));
+        // Garbage and truncations. (A wrong digest is *not* an error here:
+        // the validator re-signs rather than checks it; D3D12 does check it,
+        // which the GPU tests cover.)
+        let inputs: [&[u8]; 5] = [&[], b"DXBC", &[0u8; 64], &good[..good.len() / 2], &good[..good.len() - 4]];
+        for c in inputs {
+            if crate::gpu::recomp::dxc::create_instance().is_none() {
+                return crate::gpu::recomp::runner::skip_test("no dxcompiler.dll");
+            }
+            assert!(super::validate(c).is_err(), "accepted {} bytes", c.len());
+            let _ = super::disassemble(c);
+        }
     }
 }
