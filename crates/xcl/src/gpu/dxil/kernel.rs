@@ -180,6 +180,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         static_used: Vec::new(),
         sampler_base: o.sampler_base,
         dyn_rm: false,
+        f32_rm: false,
         has_f64_round_op: false,
         exec_cache: HashMap::new(),
         xs: None,
@@ -303,6 +304,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     // them in a program with branches, those up to the first s_endpgm in straight-line code
     let branchy = cfg.insts.iter().any(|d| crate::gpu::rdna2::branch_target(d).is_some());
     (lw.dyn_rm, lw.has_f64_round_op) = super::lower::round_modes(&cfg.insts, !branchy);
+    lw.f32_rm = super::lower_round::f32_round_writes(&cfg.insts);
     for d in cfg.insts.iter().filter(|_| kernel) {
         if !branchy && d.inst.name.starts_with("S_ENDPGM") {
             break;

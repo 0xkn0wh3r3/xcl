@@ -23,6 +23,7 @@ mod lower_geom;
 mod lower_gfx;
 mod lower_image;
 mod lower_mem;
+mod lower_round;
 mod lower_valu;
 mod lower_wide;
 pub mod module;
@@ -45,3 +46,5 @@ mod bitreader_tests;
 mod robustness_tests;
 #[cfg(test)]
 mod msaa_tests;
+#[cfg(test)]
+mod round_tests;
