@@ -59,7 +59,8 @@ fn device() -> Option<(ID3D12Device, String)> {
 
 /// The heap-window form (`Options::heap_windows`) on a real sparse window: a 4 GiB reserved
 /// buffer seen through `runner::raw_window_uav` reaches its last tile, which the sparse windows
-/// hand out (a reservation across two windows covers it), up to its last dword but one.
+/// hand out (a reservation across two windows covers it), up to its last 32 bytes (the view
+/// ends there: an older D3D12 runtime removes the device for a raw view that ends above).
 #[test]
 fn gpu_raw_window_view_reaches_its_top() {
     let Some((dev, name)) = device() else {
@@ -80,11 +81,11 @@ void main(uint l : SV_GroupThreadID) {
     RWByteAddressBuffer w = ResourceDescriptorHeap[NonUniformResourceIndex(0u)];
     w.Store(0xFFFF0000u + 4u * l, 0x5A000000u | l);
     w.Store(4u * l, 0xA5000000u | l);
-    if (l < 63u) w.Store(0xFFFFFF00u + 4u * l, 0x3C000000u | l);
+    if (l < 56u) w.Store(0xFFFFFF00u + 4u * l, 0x3C000000u | l);
     DeviceMemoryBarrier();
     outb.Store(8u * l, w.Load(0xFFFF0000u + 4u * l));
     outb.Store(8u * l + 4u, w.Load(4u * l));
-    outb.Store(512u + 4u * l, l < 63u ? w.Load(0xFFFFFF00u + 4u * l) : 0u);
+    outb.Store(512u + 4u * l, l < 56u ? w.Load(0xFFFFFF00u + 4u * l) : 0u);
 }
 "#;
     unsafe {
@@ -155,7 +156,7 @@ void main(uint l : SV_GroupThreadID) {
             assert_eq!(w[2 * l], 0x5A00_0000 | l as u32, "{name}: lane {l}, the window's top tile through the heap view");
             assert_eq!(w[2 * l + 1], 0xA500_0000 | l as u32, "{name}: lane {l}, the window's first tile");
             assert_eq!(w[192 + l], 0x5A00_0000 | l as u32, "{name}: lane {l}, the top tile in memory");
-            if l < 63 {
+            if l < 56 {
                 assert_eq!(w[128 + l], 0x3C00_0000 | l as u32, "{name}: lane {l}, the window's last dwords");
             }
         }
