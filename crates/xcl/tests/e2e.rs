@@ -271,6 +271,7 @@ fn test_title_draws_with_a_root_signature_under_the_debug_layer() {
     let bad: Vec<&str> = log.lines().filter(|l| l.contains("No root signature has been set")).collect();
     assert!(bad.is_empty(), "{} draws without a root signature, first: {}", bad.len(), bad[0]);
     // CopyMemoryToMemoryX within one window (console_list_methods) reads a buffer in COPY_SOURCE (#958)
+    assert!(log.contains("CopyMemoryToMemoryX same-window scratch copies recorded: 1"), "the test title did not record a same-window scratch copy");
     let bad: Vec<&str> = log.lines().filter(|l| l.contains("is invalid for use as a source buffer")).collect();
     assert!(bad.is_empty(), "{} copies from a buffer that is not in COPY_SOURCE, first: {}", bad.len(), bad[0]);
 }
