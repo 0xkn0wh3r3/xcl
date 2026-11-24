@@ -701,9 +701,13 @@ impl<'a> Lanes<'a> {
         if edges.is_empty() {
             return Ok((reach, st));
         }
+        // an SCC a mask op set on any incoming edge, back edges included (their masks may not
+        // count here, but a lane's own SCC carried around a loop is still a lane's: thehollowedone,
+        // #1745)
+        let scc_lane = self.preds[b].iter().any(|&(p, k)| outs[p].get(k).is_some_and(|(f, s)| *f != FALSE && s.scc.is_some_and(|x| x.1)));
         for slot in 0..=SCC {
             let get = |s: &State| if slot == SCC { s.scc.map(|x| x.0) } else { s.regs[slot] };
-            let lane = edges.iter().any(|(_, s)| s.scc.is_some_and(|x| x.1));
+            let lane = scc_lane;
             let v = if forced.contains(&(b, slot)) {
                 Some(self.atom(Atom::Join(b, slot), b)?)
             } else if edges.iter().any(|(_, s)| get(s).is_none()) {
@@ -721,6 +725,11 @@ impl<'a> Lanes<'a> {
                 })
             };
             if slot == SCC {
+                // unknown but a lane's on some edge: an unknown lane condition, not a uniform one
+                let v = match v {
+                    None if lane => Some(self.atom(Atom::Join(b, SCC), b)?),
+                    v => v,
+                };
                 st.scc = v.map(|v| (v, lane));
             } else {
                 st.regs[slot] = v;

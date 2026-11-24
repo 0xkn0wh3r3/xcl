@@ -3149,6 +3149,23 @@ pub(crate) mod tests {
             let err = lower_kernel(&decode(&p), false, Interp::default()).err().unwrap_or_else(|| panic!("{name}: taken"));
             assert!(err.contains("any lane of a mask") || err.contains("SCC of a mask op"), "{name}: {err}");
         }
+        // the mask op's SCC reaching the `s_cselect` only around the loop's back edge
+        // (thehollowedone's program on #1745: 7 where the console gives 5 in lanes 16–31)
+        let around: Vec<I> = vec![
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 130)]),
+            CMP,
+            ("S_CMP_GT_U32", "ENC_SOPC", &[("SSRC0", 129), ("SSRC1", 128)]),
+            ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 133), ("SSRC1", 135)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 1)]),
+            ("S_SUB_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)]),
+            ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 128)]),
+            ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 2)]),
+            AND,
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0xFFF9)]),
+            ENDPGM,
+        ];
+        let err = lower_kernel(&decode(&around), false, Interp::default()).err().expect("around the loop: taken");
+        assert!(err.contains("SCC of a mask op") || err.contains("any lane of a mask"), "around the loop: {err}");
         // VCC = EXEC: the same in every lane in EXEC, so each lane decides as the wave does
         let uniform: [I; 4] = [("S_MOV_B32", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 126)]), ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 1)]), MOV7, ENDPGM];
         let (s, v) = state(32);
