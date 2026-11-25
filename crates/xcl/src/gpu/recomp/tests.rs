@@ -8861,10 +8861,17 @@ fn gpu_qsad_and_mqsad() {
         return;
     }
     let vop3 = |name: &str, f: &[(&str, u64)]| encode(name, "ENC_VOP3", f, None).unwrap();
-    let run_on = |code: &[u8], st: &KernelState, wave64: bool| {
-        let t = translate(code, &on_gpu(Options { wave64, ..Default::default() })).unwrap();
-        assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
-        let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+    // both backends: HLSL + DXC, and direct DXIL
+    let run_on = |code: &[u8], st: &KernelState, wave64: bool, direct: bool| {
+        let dxil = if direct {
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && !gpu_waves().contains(&true), mem_windows: 1, sampler_base: 0 };
+            crate::gpu::dxil::kernel::translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}"))
+        } else {
+            let t = translate(code, &on_gpu(Options { wave64, ..Default::default() })).unwrap();
+            assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
+            super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}
+{}", t.hlsl))
+        };
         runner::run(&dxil, st, &[]).unwrap()
     };
     let mut code = Vec::new();
@@ -8908,19 +8915,19 @@ fn gpu_qsad_and_mqsad() {
         r[40] = 40;
     }
 
-    for (wave64, lanes) in [(false, 32usize), (true, 64usize)] {
-        let r = run_on(&code, &st, wave64);
+    for (wave64, lanes, direct) in [(false, 32usize, false), (true, 64usize, false), (false, 32, true), (true, 64, true)] {
+        let r = run_on(&code, &st, wave64, direct);
         for (l, v) in r.vgpr.iter().enumerate().take(lanes) {
-            assert_eq!((v[8], v[9]), (54 | (157 << 16), 78 | (191 << 16)), "wave64={wave64} lane {l}: v_qsad_pk_u16_u8");
-            assert_eq!((v[12], v[13]), (51 | (156 << 16), 43 | (443 << 16)), "wave64={wave64} lane {l}: v_qsad_pk_u16_u8 wrap");
-            assert_eq!((v[14], v[15]), (0xFFFF | (156 << 16), 0xFFFF | (443 << 16)), "wave64={wave64} lane {l}: v_qsad_pk_u16_u8 clamp");
-            assert_eq!((v[16], v[17]), (6 | (93 << 16), 78 | (111 << 16)), "wave64={wave64} lane {l}: v_mqsad_pk_u16_u8");
-            assert_eq!((v[18], v[19]), (0xFFFF | (92 << 16), 0xFFFF | (363 << 16)), "wave64={wave64} lane {l}: v_mqsad_pk_u16_u8 clamp");
-            assert_eq!((v[20], v[21]), (255 | (256 << 16), 257 | (258 << 16)), "wave64={wave64} lane {l}: v_mqsad_pk_u16_u8 -1/SGPR");
-            assert_eq!((v[26], v[27], v[28], v[29]), (1, 0xFFFF_FFFB, 74, 112), "wave64={wave64} lane {l}: v_mqsad_u32_u8 wrap");
-            assert_eq!((v[30], v[31], v[32], v[33]), (u32::MAX, 0xFFFF_FFFB, u32::MAX, 112), "wave64={wave64} lane {l}: v_mqsad_u32_u8 clamp");
-            assert_eq!((v[34], v[35]), (0x408B_2015, 0xFFCB_504B), "wave64={wave64} lane {l}: overlapping pk");
-            assert_eq!((v[36], v[37], v[38], v[39], v[40]), (15, 111, 105, 147, 40), "wave64={wave64} lane {l}: staggered u32");
+            assert_eq!((v[8], v[9]), (54 | (157 << 16), 78 | (191 << 16)), "direct={direct} wave64={wave64} lane {l}: v_qsad_pk_u16_u8");
+            assert_eq!((v[12], v[13]), (51 | (156 << 16), 43 | (443 << 16)), "direct={direct} wave64={wave64} lane {l}: v_qsad_pk_u16_u8 wrap");
+            assert_eq!((v[14], v[15]), (0xFFFF | (156 << 16), 0xFFFF | (443 << 16)), "direct={direct} wave64={wave64} lane {l}: v_qsad_pk_u16_u8 clamp");
+            assert_eq!((v[16], v[17]), (6 | (93 << 16), 78 | (111 << 16)), "direct={direct} wave64={wave64} lane {l}: v_mqsad_pk_u16_u8");
+            assert_eq!((v[18], v[19]), (0xFFFF | (92 << 16), 0xFFFF | (363 << 16)), "direct={direct} wave64={wave64} lane {l}: v_mqsad_pk_u16_u8 clamp");
+            assert_eq!((v[20], v[21]), (255 | (256 << 16), 257 | (258 << 16)), "direct={direct} wave64={wave64} lane {l}: v_mqsad_pk_u16_u8 -1/SGPR");
+            assert_eq!((v[26], v[27], v[28], v[29]), (1, 0xFFFF_FFFB, 74, 112), "direct={direct} wave64={wave64} lane {l}: v_mqsad_u32_u8 wrap");
+            assert_eq!((v[30], v[31], v[32], v[33]), (u32::MAX, 0xFFFF_FFFB, u32::MAX, 112), "direct={direct} wave64={wave64} lane {l}: v_mqsad_u32_u8 clamp");
+            assert_eq!((v[34], v[35]), (0x408B_2015, 0xFFCB_504B), "direct={direct} wave64={wave64} lane {l}: overlapping pk");
+            assert_eq!((v[36], v[37], v[38], v[39], v[40]), (15, 111, 105, 147, 40), "direct={direct} wave64={wave64} lane {l}: staggered u32");
         }
     }
 
@@ -8945,18 +8952,18 @@ fn gpu_qsad_and_mqsad() {
         r[6] = 0xCCCC_CCCC;
         r[7] = 0xDDDD_DDDD;
     }
-    for (wave64, lanes) in [(false, 32usize), (true, 64usize)] {
-        let r = run_on(&masked, &ms, wave64);
+    for (wave64, lanes, direct) in [(false, 32usize, false), (true, 64usize, false), (false, 32, true), (true, 64, true)] {
+        let r = run_on(&masked, &ms, wave64, direct);
         for (l, v) in r.vgpr.iter().enumerate().take(lanes) {
             let active = ((if l < 32 { ms.sgpr[126] } else { ms.sgpr[127] }) >> (l & 31)) & 1 != 0;
             if active {
-                assert_eq!((v[0], v[1]), (0x00FE_00FE, 0x00FE_00FE), "wave64={wave64} active lane {l} pk");
-                assert_eq!((v[2], v[3], v[4], v[5]), (265, 276, 287, 298), "wave64={wave64} active lane {l} u32");
-                assert_eq!((v[6], v[7]), (1020 | (1021 << 16), 1022 | (1023 << 16)), "wave64={wave64} active lane {l} vcc");
+                assert_eq!((v[0], v[1]), (0x00FE_00FE, 0x00FE_00FE), "direct={direct} wave64={wave64} active lane {l} pk");
+                assert_eq!((v[2], v[3], v[4], v[5]), (265, 276, 287, 298), "direct={direct} wave64={wave64} active lane {l} u32");
+                assert_eq!((v[6], v[7]), (1020 | (1021 << 16), 1022 | (1023 << 16)), "direct={direct} wave64={wave64} active lane {l} vcc");
             } else {
-                assert_eq!((v[0], v[1]), (0xAAAA_AAAA, 0xBBBB_BBBB), "wave64={wave64} inactive lane {l} pk");
-                assert_eq!((v[2], v[3], v[4], v[5]), (11, 22, 33, 44), "wave64={wave64} inactive lane {l} u32");
-                assert_eq!((v[6], v[7]), (0xCCCC_CCCC, 0xDDDD_DDDD), "wave64={wave64} inactive lane {l} vcc");
+                assert_eq!((v[0], v[1]), (0xAAAA_AAAA, 0xBBBB_BBBB), "direct={direct} wave64={wave64} inactive lane {l} pk");
+                assert_eq!((v[2], v[3], v[4], v[5]), (11, 22, 33, 44), "direct={direct} wave64={wave64} inactive lane {l} u32");
+                assert_eq!((v[6], v[7]), (0xCCCC_CCCC, 0xDDDD_DDDD), "direct={direct} wave64={wave64} inactive lane {l} vcc");
             }
         }
     }
