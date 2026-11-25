@@ -5347,6 +5347,23 @@ pub fn two_pass_count() -> usize {
     TWO_PASS.lock().unwrap().as_ref().map_or(0, |m| m.len())
 }
 
+#[cfg(test)]
+pub(super) fn register_two_pass_for_test(pso: usize, kind: &'static str) {
+    if pso != 0 {
+        TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(
+            pso,
+            std::sync::Arc::new(TwoPassPso {
+                compute: 0,
+                compute_rs: 0,
+                mesh_rs: 0,
+                record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 64, max_vertices: 64, max_primitives: 64 },
+                mesh_groups_per_record: 1,
+                kind,
+            }),
+        );
+    }
+}
+
 /// Subobject types whose payload is a `D3D12_SHADER_BYTECODE`.
 const SHADER_SUBOBJECTS: [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE; 8] = [
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS,
