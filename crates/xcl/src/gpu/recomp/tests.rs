@@ -2906,7 +2906,7 @@ fn gpu_images_sample_load_store_atomic() {
         assert_eq!([fl(20), fl(21), fl(22), fl(23)], [1.5, 0.0, 1.5, 1.0], "lane {l} sample_l linear");
         assert_eq!([fl(40), fl(41), fl(42), fl(43)], [1.0, 2.0, 2.0, 1.0], "lane {l} gather4 red");
         assert_eq!([fl(14), fl(15)], [x, x + 4.0 * y], "lane {l} image_load dmask x,z");
-        assert_eq!(&v[50..54], &[4, 4, 1, 1], "lane {l} get_resinfo");
+        assert_eq!(&v[50..54], &[4, 4, 0, 1], "lane {l} get_resinfo (depth 0: a DIM without layers, as RDNA2)");
     }
     let t1: Vec<u32> = r.textures[0].chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     for i in 0..16 {
@@ -9026,4 +9026,25 @@ fn gpu_scalar_sext_mulhi_and_vector_i24_sub_co_ci_u64_shifts() {
         let subrev = (inp[6] as u64).wrapping_sub(inp[8] as u64).wrapping_sub(borrow_in as u64) as u32;
         assert_eq!(v[22], subrev, "lane {l} v_subrev_co_ci_u32");
     }
+}
+
+/// image_get_resinfo with DIM 2D on a 2D MSAA T# (TYPE 14) gives (width, height, 0, 1) on RDNA2
+/// (AnyPS5#25723). A 4x2 texture of 4 samples.
+#[test]
+fn gpu_image_get_resinfo_dim_2d_of_an_msaa_tsharp() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
+    let mut code = encode("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1)], None).unwrap();
+    code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    let mut st = KernelState::default();
+    st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 14));
+    for r in st.vgpr.iter_mut() {
+        r[3] = 0;
+    }
+    let tex = [TestTexture { dim: TexDim::D2Ms(4), format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 2, depth: 1, texel_bytes: 16, data: vec![0; 4 * 2 * 4 * 16], uav: false }];
+    let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
+    assert_eq!(&r.vgpr[0][20..24], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 2D on a 4-sample T#");
 }

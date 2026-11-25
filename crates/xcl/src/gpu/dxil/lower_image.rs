@@ -744,7 +744,9 @@ impl Lw {
                 let one = lw.c(1);
                 let w = lw.s.m.extract(dims, 0);
                 let hh = lw.s.m.extract(dims, 1);
-                let dd = if dim == 7 { lw.s.m.extract(dims, 2) } else { one };
+                // 2D MSAA: depth 0, as for every DIM without layers (RDNA2)
+                let zero = lw.c(0);
+                let dd = if dim == 7 { lw.s.m.extract(dims, 2) } else { zero };
                 for (k, v) in [w, hh, dd, one].into_iter().enumerate() {
                     lw.wr(tmps[k], v);
                 }
@@ -766,11 +768,13 @@ impl Lw {
                 let tex = lw.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
                 let dims = lw.s.get_dimensions(tex.handle, Some(mipv));
                 let one = lw.c(1);
+                let zero = lw.c(0);
                 let e = |lw: &mut Lw, i: u32| lw.s.m.extract(dims, i);
                 // HLSL GetDimensions outputs per dim; missing ones are 1
                 let (w, hh, dd, n) = match dim {
-                    0 => (e(lw, 0), one, one, e(lw, 3)),
-                    1 => (e(lw, 0), e(lw, 1), one, e(lw, 3)),
+                    // RDNA2 gives 0 for the depth of a DIM without layers (1D, 2D, 2D MSAA)
+                    0 => (e(lw, 0), one, zero, e(lw, 3)),
+                    1 => (e(lw, 0), e(lw, 1), zero, e(lw, 3)),
                     // a cube array: its layers are faces, 6 per cube
                     3 => {
                         let n = e(lw, 2);

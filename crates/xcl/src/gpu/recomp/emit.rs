@@ -2816,8 +2816,9 @@ impl Em {
         if base == "get_resinfo" {
             let mipv = compu(self, 0);
             let (ty, call) = match dim {
-                0 => ("Texture1D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 1u;")),
-                1 => ("Texture2D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 1u;")),
+                // RDNA2 gives 0 for the depth of a DIM without layers (1D, 2D, 2D MSAA)
+                0 => ("Texture1D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_n); {t}_h = 1u; {t}_d = 0u;")),
+                1 => ("Texture2D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_n); {t}_d = 0u;")),
                 2 => ("Texture3D", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n);")),
                 // the hardware returns the layers (6 per cube), as for a 2D array
                 3 => ("TextureCubeArray", format!("{t}_T.GetDimensions({mipv}, {t}_w, {t}_h, {t}_d, {t}_n); {t}_d *= 6u;")),
