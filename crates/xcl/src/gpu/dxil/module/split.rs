@@ -726,6 +726,85 @@ mod tests {
         assert_eq!(result, reference);
     }
 
+    fn check_persistent_payload(reuse_hole: bool) {
+        use super::Value;
+
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        fn mix(lw: &mut Lw, mut v: Value, seed: u32) -> Value {
+            let multiplier = lw.c(33);
+            for i in 1..=12 {
+                let key = lw.c(seed + i);
+                v = lw.xor(v, key);
+                v = lw.mul(v, multiplier);
+            }
+            v
+        }
+        fn expected_mix(v: u32, seed: u32) -> u32 {
+            (1..=12).fold(v, |x, i| (x ^ (seed + i)).wrapping_mul(33))
+        }
+
+        let geometry = [32, 1, 1];
+        let options = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let cs = CsInterface { threads: geometry, ..Default::default() };
+        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+        let (tid, _) = lw.setup_lanes_compute(geometry, false);
+        let mem = lw.mems[0];
+        let offset = lw.shlc(tid, 2);
+        let first = lw.s.raw_load(mem, offset, 1)[0];
+        let saved = mix(&mut lw, first, 10);
+        let middle = lw.s.m.new_block();
+        let last = lw.s.m.new_block();
+        // every lane takes the middle block; the branch only keeps the optimiser from merging it
+        let entry = lw.cur();
+        let width = lw.s.wave_lane_count();
+        let taken = lw.cmp(Pred::ULt, tid, width);
+        lw.s.m.cond_br(taken, middle, last);
+        lw.s.m.set_block(middle);
+        let replacement = mix(&mut lw, if reuse_hole { first } else { tid }, 30);
+        lw.s.raw_store(mem, offset, &[replacement]);
+        lw.s.m.br(last);
+        lw.s.m.set_block(last);
+        let i32 = lw.s.m.i32();
+        let arrived = lw.s.m.phi(i32);
+        lw.s.m.add_incoming(arrived, replacement, middle);
+        lw.s.m.add_incoming(arrived, first, entry);
+        let input = if reuse_hole { lw.xor(saved, arrived) } else { saved };
+        let output = mix(&mut lw, input, 50);
+        lw.s.raw_store(mem, offset, &[output]);
+        lw.s.m.ret();
+        lw.s.m.optimize();
+
+        let limit = lw.s.m.blocks.iter().map(Vec::len).max().unwrap();
+        let plan = lw.s.m.dispatch_plan(limit).unwrap();
+        assert_eq!(plan.blocks.len(), 3);
+        let incoming = plan.edges.iter().find(|edge| edge.to == middle).unwrap();
+        let outgoing = plan.edges.iter().find(|edge| edge.from == middle && edge.to == last).unwrap();
+        assert!(incoming.live.contains(&saved) && outgoing.live.contains(&saved));
+        if reuse_hole {
+            // In compact per-edge order, the replacement occupies saved's old
+            // slot. A delayed load of saved from that slot would get replacement.
+            let slot = |edge: &super::Edge, v| {
+                edge.live.iter().filter(|&&x| lw.s.m.transport_words(x) == Some(1)).position(|&x| x == v).unwrap()
+            };
+            assert_eq!(slot(incoming, saved), slot(outgoing, replacement));
+        }
+
+        let chain = lw.s.split_compute(geometry, None, limit).unwrap();
+        let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+        let initial: Vec<u32> = (0..32).map(|i| 1009 * i + 77).collect();
+        let mut expected: Vec<_> = initial.iter().map(|&v| {
+            let saved = expected_mix(v, 10);
+            expected_mix(if reuse_hole { saved ^ expected_mix(v, 30) } else { saved }, 50)
+        }).collect();
+        // The runners read back at least 64 words. Only lanes 0..32 write.
+        expected.resize(64, 0);
+        assert_eq!(runner::dispatch(&whole, [1, 1, 1], &[], &initial).unwrap(), expected);
+        assert_eq!(runner::dispatch_split(&chain, [1, 1, 1], &initial).unwrap(), expected);
+    }
+
     /// A typed UAV load in one piece only: the whole program declares its flag, the other pieces
     /// must not (the validator wants flags to match usage, and a refused piece leaves it whole).
     #[test]
@@ -766,6 +845,12 @@ mod tests {
         let chain = lw.s.split_compute(geometry, None, limit).expect("every piece validates");
         assert!(chain.pieces.len() >= 2);
     }
+
+    #[test]
+    fn dispatch_chain_payload_skips_middle_piece() { check_persistent_payload(false); }
+
+    #[test]
+    fn dispatch_chain_payload_survives_reused_edge_slot() { check_persistent_payload(true); }
 
     #[test]
     fn dispatch_chain_wave32_live_loops() { compare(32); }
