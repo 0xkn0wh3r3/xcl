@@ -662,6 +662,7 @@ mod tests {
     #[test]
     fn dispatch_chain_wave32_live_loops() { compare(32); }
 
+    /// A guest wave64 split across two hardware wave32s.
     #[test]
     fn dispatch_chain_wave64_live_loops_and_exchange() { compare(64); }
     /// Early exits and forward skips retain their own continuation tags; group

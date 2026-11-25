@@ -630,6 +630,50 @@ impl Lw {
     }
 }
 
+#[cfg(test)]
+#[test]
+fn dispatch_chain_native_wave64_builds_whole() {
+    use crate::gpu::recomp::runner;
+
+    let threads = [64, 1, 1];
+    let cs = CsInterface { threads, ..Default::default() };
+    let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+    let (tid, _) = lw.setup_lanes_compute(threads, false);
+    let offset = lw.shlc(tid, 2);
+    let width = lw.s.wave_lane_count();
+    let mem = lw.mems[0];
+    // conditional updates: blocks the optimiser cannot merge into one
+    for _ in 0..40 {
+        let update = lw.s.m.new_block();
+        let join = lw.s.m.new_block();
+        let taken = lw.cmp(Pred::ULt, tid, width);
+        lw.s.m.cond_br(taken, update, join);
+        lw.s.m.set_block(update);
+        let old = lw.s.raw_load(mem, offset, 1)[0];
+        let new = lw.add(old, width);
+        lw.s.raw_store(mem, offset, &[new]);
+        lw.s.m.br(join);
+        lw.s.m.set_block(join);
+    }
+    lw.s.m.ret();
+    lw.s.m.optimize();
+    // Exercise the native-wave admission gate with an otherwise partitionable CFG.
+    assert!(lw.s.m.dispatch_plan(64).is_some());
+    let program = lw.finish_dispatch(threads, 64, 64, None).unwrap();
+    assert!(program.dispatch_chain.is_none());
+    super::validate::validate(&program.dxil).expect("valid native wave64 whole shader");
+
+    if !runner::wave64_supported().unwrap_or(false) {
+        runner::skip_test("no wave64");
+        return;
+    }
+    let initial: Vec<u32> = (1..=64).collect();
+    let expected: Vec<_> = initial.iter().map(|v| v + 40 * 64).collect();
+    let result = runner::dispatch(&program.dxil, [1, 1, 1], &[], &initial).unwrap();
+    assert_eq!(result, expected);
+}
+
 /// The kernel's epilogue: SGPRs and SCC from lane 0, every touched VGPR per lane.
 fn store_registers(lw: &mut Lw, res: super::shader::RawUav) {
     let touched: Vec<u32> = lw.init.touched.iter().copied().collect();
