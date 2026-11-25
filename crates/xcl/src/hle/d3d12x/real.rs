@@ -1135,11 +1135,26 @@ unsafe extern "system" fn dev_increment_size_x(this: *mut c_void, ty: u32) -> u3
 /// What a console view slot describes: (GFX10 format, image type, width, height, depth, mips)
 /// from the view (or the resource when the view is NULL); None for buffers.
 unsafe fn view_shape(res: &ID3D12Resource, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, dim: i32, array: u32, mips: u32) -> Option<(u32, crate::gpu::desc::ImageType, u32, u32, u32, u32)> {
-    use crate::gpu::desc::ImageType as T;
     let r = res.GetDesc();
+    let (fmt, ty, w, h, depth, _, last_level, _) = view_shape_desc(&r, format, dim, array, 0, mips)?;
+    Some((fmt, ty, w, h, depth, last_level + 1))
+}
+
+/// Pure-desc shape and mip/sample-level breakdown for a console texture view:
+/// `(gfx10_format, image_type, width, height, depth, base_level, last_level, max_mip)`.
+/// For MSAA views, `base_level = 0`, `last_level = log2(SampleDesc.Count)` (GFX10 T# ABI),
+/// and `max_mip = 0`.
+fn view_shape_desc(
+    r: &D3D12_RESOURCE_DESC,
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    dim: i32,
+    array: u32,
+    base_mip: u32,
+    mips: u32,
+) -> Option<(u32, crate::gpu::desc::ImageType, u32, u32, u32, u32, u32, u32)> {
+    use crate::gpu::desc::ImageType as T;
     let f = if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { r.Format } else { format };
     let fmt = crate::gpu::desc::gfx10_format(f).unwrap_or(0);
-    let mips = if mips == 0 || mips == u32::MAX { r.MipLevels as u32 } else { mips };
     let (w, h, d) = (r.Width as u32, r.Height, r.DepthOrArraySize as u32);
     let ty = match dim {
         2 => T::D1,
@@ -1159,7 +1174,52 @@ unsafe fn view_shape(res: &ID3D12Resource, format: windows::Win32::Graphics::Dxg
         T::Cube => array.max(6),
         _ => 1,
     };
-    Some((fmt, ty, w, h, depth, mips))
+    let (base_level, last_level, max_mip) = if matches!(ty, T::D2Msaa | T::D2MsaaArray) {
+        (0, r.SampleDesc.Count.max(1).trailing_zeros().min(4), 0)
+    } else {
+        let res_max_mip = (r.MipLevels as u32).max(1) - 1;
+        let base = base_mip.min(res_max_mip).min(15);
+        let last = if mips == 0 || mips == u32::MAX {
+            res_max_mip
+        } else {
+            base.saturating_add(mips.saturating_sub(1)).min(res_max_mip)
+        }
+        .min(15);
+        (base, last, res_max_mip.min(15))
+    };
+    Some((fmt, ty, w, h, depth, base_level, last_level, max_mip))
+}
+
+/// Build the XCL shader-ABI T# for an SRV, populating GFX10 `BASE_LEVEL` (`t[3][15:12]`),
+/// `LAST_LEVEL` (`t[3][19:16]`, or `log2(SampleDesc.Count)` for MSAA), and `MAX_MIP` (`t[5][7:4]`).
+fn srv_tsharp_from_desc(slot_index: u32, r: &D3D12_RESOURCE_DESC, desc: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> Option<[u32; 8]> {
+    let (format, dim, array, base_mip, mips) = match desc {
+        Some(v) => {
+            // SAFETY: each branch reads the union member selected by `v.ViewDimension`.
+            let (array, base_mip, mips) = unsafe {
+                let a = &v.Anonymous;
+                match v.ViewDimension.0 {
+                    2 => (1, a.Texture1D.MostDetailedMip, a.Texture1D.MipLevels),
+                    3 => (a.Texture1DArray.ArraySize, a.Texture1DArray.MostDetailedMip, a.Texture1DArray.MipLevels),
+                    4 => (1, a.Texture2D.MostDetailedMip, a.Texture2D.MipLevels),
+                    5 => (a.Texture2DArray.ArraySize, a.Texture2DArray.MostDetailedMip, a.Texture2DArray.MipLevels),
+                    6 => (1, 0, 1),
+                    7 => (a.Texture2DMSArray.ArraySize, 0, 1),
+                    8 => (1, a.Texture3D.MostDetailedMip, a.Texture3D.MipLevels),
+                    9 => (6, a.TextureCube.MostDetailedMip, a.TextureCube.MipLevels),
+                    10 => (a.TextureCubeArray.NumCubes.max(1) * 6, a.TextureCubeArray.MostDetailedMip, a.TextureCubeArray.MipLevels),
+                    _ => (1, 0, 1),
+                }
+            };
+            (v.Format, v.ViewDimension.0, array, base_mip, mips)
+        }
+        None => (r.Format, resource_dim_to_view(r), r.DepthOrArraySize as u32, 0, r.MipLevels as u32),
+    };
+    let (fmt, ty, w, h, d, base_level, last_level, max_mip) = view_shape_desc(r, format, dim, array, base_mip, mips)?;
+    let mut t = crate::gpu::desc::xcl_image_for_view(slot_index, fmt, ty, w, h, d, 1);
+    t[3] = (t[3] & !0x000F_F000) | ((base_level & 0xF) << 12) | ((last_level & 0xF) << 16);
+    t[5] = (t[5] & !0x0000_00F0) | ((max_mip & 0xF) << 4);
+    Some(t)
 }
 
 fn resource_dim_to_view(r: &D3D12_RESOURCE_DESC) -> i32 {
@@ -1236,7 +1296,7 @@ unsafe fn place_console_texture(this: *mut c_void, desc: usize, state: usize, cl
             type F = unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
             let pc: F = std::mem::transmute(orig_fn(this, 25));
             let mut r = [0u64; 2];
-            pc(this, &mut r, 0, 1, &super::device_x::pc_resource_desc(&x));
+            pc(this, &mut r, 0, 1, &super::device_x::pc_resource_desc_for_device(this, &x));
             (r[0], r[1])
         }
     };
@@ -2113,29 +2173,9 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
         return super::console_heap::write(&slot, &buffer_view(res as usize, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw));
     }
-    let (format, dim, array, mips) = match desc.as_ref() {
-        Some(v) => {
-            let a = &v.Anonymous;
-            let (array, mips) = match v.ViewDimension.0 {
-                2 => (1, a.Texture1D.MipLevels),
-                3 => (a.Texture1DArray.ArraySize, a.Texture1DArray.MipLevels),
-                4 => (1, a.Texture2D.MipLevels),
-                5 => (a.Texture2DArray.ArraySize, a.Texture2DArray.MipLevels),
-                7 => (a.Texture2DMSArray.ArraySize, 1),
-                8 => (1, a.Texture3D.MipLevels),
-                9 => (6, a.TextureCube.MipLevels),
-                10 => (a.TextureCubeArray.NumCubes.max(1) * 6, a.TextureCubeArray.MipLevels),
-                _ => (1, 1),
-            };
-            (v.Format, v.ViewDimension.0, array, mips)
-        }
-        None => {
-            let d = r.GetDesc();
-            (d.Format, resource_dim_to_view(&d), d.DepthOrArraySize as u32, d.MipLevels as u32)
-        }
-    };
-    match view_shape(r, format, dim, array, mips) {
-        Some((fmt, ty, w, h, d, m)) => super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, m)),
+    let rdesc = r.GetDesc();
+    match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
+        Some(t) => super::console_heap::write(&slot, &t),
         None => {
             note_buffer_view();
             super::console_heap::write(&slot, &[0; 8]);
@@ -2421,13 +2461,18 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     // not placed in unified memory (e.g. its coherent window kept for readback heaps): a PC
     // resource of the PC's description – the console's flag bits (0x1000000, 0x300000 …) and
     // alignments made the PC refuse Fortnite's 3264x1836 scene targets (E_INVALIDARG, a crash)
-    let pc_full = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38)).then(|| super::device_x::pc_resource_desc(&(console_desc as *const [u8; 0x38]).read_unaligned()));
+    let pc_full = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38))
+        .then(|| super::device_x::pc_resource_desc_for_device(this, &(console_desc as *const [u8; 0x38]).read_unaligned()));
     let desc = pc_full.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     let mut clear_buf = [0u8; 24];
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
-    // console-only state bits (e.g. 0x100000 on a display target) are not the PC's; a depth
-    // buffer the PC description took ALLOW_UNORDERED_ACCESS from does not start as a UAV
-    let st = pc_full.as_ref().map_or(state as u32 & PC_RESOURCE_STATES, |d| super::device_x::pc_initial_state(u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()), state as u32));
+    // console-only state bits (e.g. 0x100000 on a display target) are not the PC's; a resource
+    // the PC description took ALLOW_UNORDERED_ACCESS from does not start as a UAV
+    let st = pc_full.as_ref().map_or(state as u32 & PC_RESOURCE_STATES, |d| {
+        let orig_flags = u32::from_le_bytes((console_desc as *const [u8; 0x38]).read_unaligned()[0x30..0x34].try_into().unwrap());
+        let pc_flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+        super::device_x::pc_initial_state_for_desc(orig_flags, pc_flags, state as u32)
+    });
     let hr = dev_create_committed_resource(this, props, flags, desc, st as usize, clear, riid, ppv);
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
@@ -2920,8 +2965,9 @@ unsafe fn pc_heap_desc(heap: usize) -> Option<D3D12_HEAP_DESC> {
 unsafe fn pc_allocation_size(device: *mut c_void, d: &[u8; 0x38]) -> u64 {
     type F = unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
     let f: F = std::mem::transmute(orig_fn(device, 25));
+    let safe = super::device_x::strip_unsupported_uav_for_device(device, *d);
     let mut r = [0u64; 2];
-    f(device, &mut r, 0, 1, d);
+    f(device, &mut r, 0, 1, &safe);
     r[0]
 }
 creator!(dev_create_placed_resource1, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
@@ -5429,15 +5475,37 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
     // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
     let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
+    // Extract PC-mapped render target formats upfront so BLEND (type 8) can be sanitized for
+    // integer RTVs regardless of subobject order in the stream.
+    let mut rt_count = 0u32;
+    let mut rt_formats = [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0); 8];
+    if let Some((_, p)) = subs.iter().find(|(ty, p)| *ty == 15 && p.len() >= 36) {
+        for k in 0..8 {
+            let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+            rt_formats[k] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
+        }
+        rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
+    }
     for (ty, payload) in &subs {
         let skip = [0, 2, 14, 19, 24, 25].contains(ty); // RS, PS, topology, cached PSO, AS, MS
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
+            // BLEND: clear BlendEnable / LogicOpEnable on integer render targets (PC D3D12 rejects them)
+            if *ty == 8 && payload.len() >= std::mem::size_of::<D3D12_BLEND_DESC>() {
+                let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(payload.as_ptr() as *const D3D12_BLEND_DESC);
+                sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
+                out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
+                continue;
+            }
             // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
             if (*ty == 15 && payload.len() >= 32) || (*ty == 16 && payload.len() >= 4) {
                 let mut p = payload.to_vec();
                 for k in 0..if *ty == 15 { 8 } else { 1 } {
-                    let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+                    let f = if *ty == 15 {
+                        super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()))
+                    } else {
+                        super::device_x::pc_view_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()))
+                    };
                     p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
                 }
                 out.raw(*ty, &p, palign == 8);
@@ -5499,14 +5567,19 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return E_INVALIDARG };
     let mut out = two_pass_mesh_stream(rs, &tp.ms, ps.as_deref());
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &d.BlendState);
+    let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, RTFormats: d.RTVFormats };
+    for f in rt.RTFormats.iter_mut() {
+        *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
+    }
+    let dsv = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(d.DSVFormat.0 as u32) as i32);
+    let mut blend = d.BlendState;
+    sanitize_integer_rt_blend(&mut blend, rt.NumRenderTargets, &rt.RTFormats);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &d.DepthStencilState);
-    let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, ..Default::default() };
-    rt.RTFormats = d.RTVFormats;
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &d.DSVFormat);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &dsv);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &d.SampleDesc);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, &d.NodeMask);
     if d.Flags.0 != 0 {
@@ -5524,7 +5597,22 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
-    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+    let (mesh, rt_count, rt_formats) = {
+        let mut mesh = false;
+        let mut rt_count = 0u32;
+        let mut rt_formats = [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0); 8];
+        if let Some(subs) = stream_subobjects(&buf) {
+            mesh = subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32);
+            if let Some((_, p)) = subs.iter().find(|(ty, p)| *ty == 15 && p.len() >= 36) {
+                for k in 0..8 {
+                    let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+                    rt_formats[k] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(f as i32);
+                }
+                rt_count = u32::from_le_bytes(p[32..36].try_into().unwrap());
+            }
+        }
+        (mesh, rt_count, rt_formats)
+    };
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
     while off + 8 <= size {
@@ -5548,6 +5636,22 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             6 => put(&mut buf, &d.cs),
             3 | 4 | 5 | 24 => put(&mut buf, &[]),
             25 => put(&mut buf, &dm?.0),
+            8 if psize >= std::mem::size_of::<D3D12_BLEND_DESC>() => {
+                let mut blend: D3D12_BLEND_DESC = std::ptr::read_unaligned(buf[at..].as_ptr() as *const D3D12_BLEND_DESC);
+                sanitize_integer_rt_blend(&mut blend, rt_count, &rt_formats);
+                let bytes = std::slice::from_raw_parts(&blend as *const D3D12_BLEND_DESC as *const u8, std::mem::size_of::<D3D12_BLEND_DESC>());
+                buf[at..at + bytes.len()].copy_from_slice(bytes);
+            }
+            15 if psize >= 32 => {
+                for k in 0..8 {
+                    let f = super::device_x::pc_target_format(u32::from_le_bytes(buf[at + 4 * k..at + 4 * k + 4].try_into().unwrap()));
+                    buf[at + 4 * k..at + 4 * k + 4].copy_from_slice(&f.to_le_bytes());
+                }
+            }
+            16 if psize >= 4 => {
+                let f = super::device_x::pc_view_format(u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()));
+                buf[at..at + 4].copy_from_slice(&f.to_le_bytes());
+            }
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
             7 => buf[at..at + 32].fill(0),        // stream output
             _ => {}
@@ -5598,6 +5702,89 @@ fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, String> {
     pso::rect_list_gs(vs)
 }
 
+/// Whether `f` is an integer (`*_UINT` / `*_SINT`) DXGI render target format on which PC D3D12
+/// forbids `BlendEnable = TRUE` (console hardware silently ignores blending on integer RTs).
+fn is_integer_dxgi_format(f: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    matches!(
+        f,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+/// Clear `BlendEnable` and `LogicOpEnable` for every active integer (`*_UINT`/`*_SINT`) render
+/// target slot so PC D3D12 accepts console PSOs that leave blending enabled on integer RTs.
+/// When `IndependentBlendEnable` is false and a mix of integer and non-integer RTs has blending
+/// enabled on slot 0, promote to `IndependentBlendEnable = TRUE` so non-integer slots keep
+/// blending while integer slots have it cleared (clearing `LogicOpEnable` on all slots as D3D12
+/// requires when independent blend is enabled).
+fn sanitize_integer_rt_blend(
+    blend: &mut D3D12_BLEND_DESC,
+    num_render_targets: u32,
+    rt_formats: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 8],
+) {
+    let n = (num_render_targets as usize).min(8);
+    if n == 0 {
+        return;
+    }
+    if blend.IndependentBlendEnable.as_bool() {
+        for i in 0..n {
+            if is_integer_dxgi_format(rt_formats[i]) {
+                blend.RenderTarget[i].BlendEnable = false.into();
+                blend.RenderTarget[i].LogicOpEnable = false.into();
+            }
+        }
+        return;
+    }
+    let any_int = (0..n).any(|i| is_integer_dxgi_format(rt_formats[i]));
+    if !any_int {
+        return;
+    }
+    let rt0_blend = blend.RenderTarget[0].BlendEnable.as_bool();
+    let rt0_logic = blend.RenderTarget[0].LogicOpEnable.as_bool();
+    if !rt0_blend && !rt0_logic {
+        return;
+    }
+    let any_non_int = (0..n).any(|i| !is_integer_dxgi_format(rt_formats[i]));
+    if rt0_blend && any_non_int {
+        let mut base = blend.RenderTarget[0];
+        base.LogicOpEnable = false.into();
+        blend.IndependentBlendEnable = true.into();
+        for i in 0..8 {
+            blend.RenderTarget[i] = base;
+        }
+        for i in 0..n {
+            if is_integer_dxgi_format(rt_formats[i]) {
+                blend.RenderTarget[i].BlendEnable = false.into();
+                blend.RenderTarget[i].LogicOpEnable = false.into();
+            }
+        }
+    } else {
+        blend.RenderTarget[0].BlendEnable = false.into();
+        blend.RenderTarget[0].LogicOpEnable = false.into();
+    }
+}
+
 /// A topology type the PC has: the console's for rect lists (19, with draws of topology 17 –
 /// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists (the rects' fourth
 /// corners come from `pso::rect_list_gs`, added by `translated_graphics_pso`); UNDEFINED (a stream
@@ -5608,8 +5795,178 @@ fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
     for f in g.RTVFormats.iter_mut() {
         *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
     }
+    sanitize_integer_rt_blend(&mut g.BlendState, g.NumRenderTargets, &g.RTVFormats);
     if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
         g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
+    }
+}
+
+#[cfg(test)]
+mod pso_blend_and_tsharp_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn integer_rtv_blend_sanitization_clears_uint_sint_and_preserves_float() {
+        assert!(is_integer_dxgi_format(DXGI_FORMAT_R8_UINT));
+        assert!(is_integer_dxgi_format(DXGI_FORMAT_R16G16_SINT));
+        assert!(is_integer_dxgi_format(DXGI_FORMAT_R10G10B10A2_UINT));
+        assert!(is_integer_dxgi_format(DXGI_FORMAT_R32G32B32A32_SINT));
+        assert!(!is_integer_dxgi_format(DXGI_FORMAT_R8G8B8A8_UNORM));
+        assert!(!is_integer_dxgi_format(DXGI_FORMAT_R16G16B16A16_FLOAT));
+        assert!(!is_integer_dxgi_format(DXGI_FORMAT_UNKNOWN));
+
+        // Case 1: IndependentBlendEnable=TRUE -> clears only integer RT slots, preserves float slots.
+        let mut g: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
+        g.NumRenderTargets = 3;
+        g.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.RTVFormats[1] = DXGI_FORMAT_R8_UINT;
+        g.RTVFormats[2] = DXGI_FORMAT_R16G16_SINT;
+        g.BlendState.IndependentBlendEnable = true.into();
+        for i in 0..3 {
+            g.BlendState.RenderTarget[i].BlendEnable = true.into();
+            g.BlendState.RenderTarget[i].LogicOpEnable = true.into();
+            g.BlendState.RenderTarget[i].RenderTargetWriteMask = 0xF;
+        }
+        pc_topology_type(&mut g);
+        assert!(g.BlendState.IndependentBlendEnable.as_bool());
+        assert!(g.BlendState.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!g.BlendState.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!g.BlendState.RenderTarget[1].LogicOpEnable.as_bool());
+        assert!(!g.BlendState.RenderTarget[2].BlendEnable.as_bool());
+        assert!(!g.BlendState.RenderTarget[2].LogicOpEnable.as_bool());
+        assert_eq!(g.BlendState.RenderTarget[1].RenderTargetWriteMask, 0xF);
+
+        // Case 2: IndependentBlendEnable=FALSE with mixed float + integer RTs -> promotes to independent blend.
+        let mut m: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
+        m.NumRenderTargets = 2;
+        m.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        m.RTVFormats[1] = DXGI_FORMAT_R32_UINT;
+        m.BlendState.IndependentBlendEnable = false.into();
+        m.BlendState.RenderTarget[0].BlendEnable = true.into();
+        m.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        m.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        m.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xF;
+        pc_topology_type(&mut m);
+        assert!(m.BlendState.IndependentBlendEnable.as_bool());
+        assert!(m.BlendState.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!m.BlendState.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!m.BlendState.RenderTarget[1].LogicOpEnable.as_bool());
+        assert_eq!(m.BlendState.RenderTarget[1].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+
+        // Case 3: IndependentBlendEnable=FALSE with all-integer RTs -> clears slot 0 without enabling independent blend.
+        let mut a: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::mem::zeroed() };
+        a.NumRenderTargets = 1;
+        a.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UINT;
+        a.BlendState.IndependentBlendEnable = false.into();
+        a.BlendState.RenderTarget[0].BlendEnable = true.into();
+        a.BlendState.RenderTarget[0].LogicOpEnable = true.into();
+        pc_topology_type(&mut a);
+        assert!(!a.BlendState.IndependentBlendEnable.as_bool());
+        assert!(!a.BlendState.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!a.BlendState.RenderTarget[0].LogicOpEnable.as_bool());
+    }
+
+    #[test]
+    fn rt_format_array_layout_matches_stream_parsing() {
+        assert_eq!(std::mem::offset_of!(D3D12_RT_FORMAT_ARRAY, RTFormats), 0);
+        assert_eq!(std::mem::offset_of!(D3D12_RT_FORMAT_ARRAY, NumRenderTargets), 32);
+        assert_eq!(std::mem::size_of::<D3D12_RT_FORMAT_ARRAY>(), 36);
+    }
+
+    #[test]
+    fn srv_tsharp_populates_base_level_and_msaa_last_level() {
+        // Non-MSAA 2D texture with MostDetailedMip > 0 (CS_MinTimestepReduce extracts BASE_LEVEL = (t[3] >> 12) & 0xF).
+        let tex2d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 512,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 9,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 3, MipLevels: 4, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+            },
+        };
+        let t = srv_tsharp_from_desc(42, &tex2d, Some(&srv)).unwrap();
+        let img = crate::gpu::desc::image(&t).unwrap();
+        assert_eq!(t[0], 42);
+        assert_eq!((t[3] >> 12) & 0xF, 3, "BASE_LEVEL must encode MostDetailedMip");
+        assert_eq!((t[3] >> 16) & 0xF, 6, "LAST_LEVEL = base + mips - 1");
+        assert_eq!((t[5] >> 4) & 0xF, 8, "MAX_MIP = res.MipLevels - 1");
+        assert_eq!((img.width, img.height, img.base_level, img.last_level, img.max_mip), (512, 256, 3, 6, 8));
+        assert_eq!((img.width >> img.base_level, img.height >> img.base_level), (64, 32));
+        let (re_res, re_srv) = crate::gpu::desc::image_d3d12(&img).unwrap();
+        assert_eq!(re_res.MipLevels, 9);
+        assert_eq!(unsafe { (re_srv.Anonymous.Texture2D.MostDetailedMip, re_srv.Anonymous.Texture2D.MipLevels) }, (3, 4));
+
+        // MipLevels == u32::MAX (all remaining mips from MostDetailedMip through res.MipLevels - 1).
+        let srv_all = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 2, MipLevels: u32::MAX, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+            },
+            ..srv
+        };
+        let img_all = crate::gpu::desc::image(&srv_tsharp_from_desc(7, &tex2d, Some(&srv_all)).unwrap()).unwrap();
+        assert_eq!((img_all.base_level, img_all.last_level, img_all.max_mip), (2, 8, 8));
+
+        // MSAA 2D & 2DArray SRVs: LAST_LEVEL = log2(SampleDesc.Count) (PS_PuddleDetect / MSAA resinfo).
+        for (samples, want_last) in [(2u32, 1u32), (4, 2), (8, 3)] {
+            let msaa = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1920,
+                Height: 1080,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
+                ..Default::default()
+            };
+            let msaa_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMS,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                ..Default::default()
+            };
+            let t_ms = srv_tsharp_from_desc(99, &msaa, Some(&msaa_srv)).unwrap();
+            let img_ms = crate::gpu::desc::image(&t_ms).unwrap();
+            assert_eq!(img_ms.ty, crate::gpu::desc::ImageType::D2Msaa);
+            assert_eq!((img_ms.base_level, img_ms.last_level), (0, want_last), "{samples}x MSAA");
+            let (re_ms, _) = crate::gpu::desc::image_d3d12(&img_ms).unwrap();
+            assert_eq!(re_ms.SampleDesc.Count, samples);
+
+            // Default NULL SRV desc on an MSAA resource must also populate LAST_LEVEL = log2(samples).
+            let img_null = crate::gpu::desc::image(&srv_tsharp_from_desc(99, &msaa, None).unwrap()).unwrap();
+            assert_eq!((img_null.ty, img_null.base_level, img_null.last_level), (crate::gpu::desc::ImageType::D2Msaa, 0, want_last));
+        }
+
+        let msaa_arr = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1280,
+            Height: 720,
+            DepthOrArraySize: 4,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16G16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 },
+            ..Default::default()
+        };
+        let msaa_arr_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R16G16_FLOAT,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV { FirstArraySlice: 0, ArraySize: 4 },
+            },
+        };
+        let img_arr = crate::gpu::desc::image(&srv_tsharp_from_desc(11, &msaa_arr, Some(&msaa_arr_srv)).unwrap()).unwrap();
+        assert_eq!((img_arr.ty, img_arr.depth, img_arr.base_level, img_arr.last_level), (crate::gpu::desc::ImageType::D2MsaaArray, 4, 0, 2));
     }
 }
 
