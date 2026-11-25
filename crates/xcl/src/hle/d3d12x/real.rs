@@ -920,7 +920,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (17, dev_create_cbv_x as usize),
                 (18, dev_create_srv_x as usize),
                 (21, dev_create_dsv_x as usize),
-                (19, dev_create_uav_x as usize),
+                (19, dev_create_uav_checked_x as usize),
                 (22, dev_create_sampler_x as usize),
                 (23, dev_copy_descriptors_x as usize),
                 (24, dev_copy_descriptors_simple_x as usize),
@@ -1074,6 +1074,7 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     let visible = d[2] & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32 != 0;
     let shared = match ID3D12Device::from_raw_borrowed(&this) {
         Some(dev) if !sampler && !desc.is_null() => super::console_heap::shared_heap(dev),
+        Some(dev) if sampler && !desc.is_null() => super::console_heap::shared_sampler_heap(dev),
         _ => false,
     };
     let flags = if shared { d[2] & !(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32) } else { d[2] };
@@ -1858,6 +1859,7 @@ pub(super) unsafe extern "system" fn dev_create_sampler_x(this: *mut c_void, des
     let f: unsafe extern "system" fn(*mut c_void, *const D3D12_SAMPLER_DESC, u64) = std::mem::transmute(orig_fn(this, 22));
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| s.sampler) else { return f(this, desc, cpu) };
     f(this, desc, slot.pc_srv);
+    super::console_heap::publish(&slot, false);
     super::console_heap::write(&slot, &[0, 0, 0, slot.index & 0xFFF]);
 }
 
@@ -1872,9 +1874,7 @@ unsafe fn copy_console_slots(this: *mut c_void, n: u32, dst: u64, src: u64, ty: 
     let ty = pc_heap_type(ty);
     let f: unsafe extern "system" fn(*mut c_void, u32, u64, u64, u32) = std::mem::transmute(orig_fn(this, 24));
     f(this, if d0.sampler { n } else { 2 * n }, d0.pc_srv, s0.pc_srv, ty);
-    if !d0.sampler {
-        super::console_heap::publish_range(&d0, n);
-    }
+    super::console_heap::publish_range(&d0, n);
     let step = if d0.sampler { SAMPLER_SLOT } else { SLOT } as u64;
     for k in 0..n as u64 {
         if let (Some(d), Some(s)) = (slot(dst + k * step), slot(src + k * step)) {
@@ -1957,6 +1957,95 @@ unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
         super::console_heap::unregister(this as usize);
     }
     n
+}
+
+/// Default UAV dimension for a texture resource when `CreateUnorderedAccessView` receives a NULL desc.
+fn default_uav_dimension(rd: &D3D12_RESOURCE_DESC) -> D3D12_UAV_DIMENSION {
+    match rd.Dimension {
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            if rd.DepthOrArraySize > 1 { D3D12_UAV_DIMENSION_TEXTURE1DARRAY } else { D3D12_UAV_DIMENSION_TEXTURE1D }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => D3D12_UAV_DIMENSION_TEXTURE3D,
+        _ => {
+            if rd.DepthOrArraySize > 1 { D3D12_UAV_DIMENSION_TEXTURE2DARRAY } else { D3D12_UAV_DIMENSION_TEXTURE2D }
+        }
+    }
+}
+
+/// Build an explicit default `D3D12_UNORDERED_ACCESS_VIEW_DESC` matching `rd`'s dimension and
+/// array/depth extent with format `fmt` (used when `desc` was NULL and `rd.Format` needed linear/view mapping).
+fn default_uav_desc(rd: &D3D12_RESOURCE_DESC, fmt: u32) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let dim = default_uav_dimension(rd);
+    let mut d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(fmt as i32),
+        ViewDimension: dim,
+        ..Default::default()
+    };
+    match dim {
+        D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+            d.Anonymous.Texture1DArray.ArraySize = rd.DepthOrArraySize as u32;
+        }
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+            d.Anonymous.Texture2DArray.ArraySize = rd.DepthOrArraySize as u32;
+        }
+        D3D12_UAV_DIMENSION_TEXTURE3D => {
+            d.Anonymous.Texture3D.WSize = rd.DepthOrArraySize as u32;
+        }
+        _ => {}
+    }
+    d
+}
+
+/// Device #19 wrapper: guards non-depth texture UAVs against sRGB or host-unsupported
+/// `D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW` formats (preventing `0x887A0001`)
+/// before delegating to `dev_create_uav_x`.
+unsafe extern "system" fn dev_create_uav_checked_x(
+    this: *mut c_void,
+    res: *mut c_void,
+    counter: *mut c_void,
+    desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    cpu: u64,
+) {
+    if let Some(r) = ID3D12Resource::from_raw_borrowed(&res) {
+        let rd = r.GetDesc();
+        let is_tex = rd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER;
+        let has_uav_flag = rd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0;
+        if is_tex && has_uav_flag {
+            let mut patched = desc.as_ref().copied();
+            let raw_fmt = patched.as_ref().map_or(0, |d| d.Format.0 as u32);
+            let res_fmt = rd.Format.0 as u32;
+            let mapped_fmt = super::device_x::pc_uav_linear_format(if raw_fmt == 0 { res_fmt } else { raw_fmt });
+            let eff_fmt = super::device_x::pc_shader_view_format(res_fmt, mapped_fmt);
+            if let Some(c) = patched.as_mut() {
+                if eff_fmt != 0 && (eff_fmt != raw_fmt && (raw_fmt != 0 || eff_fmt != res_fmt)) {
+                    c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(eff_fmt as i32);
+                }
+            } else if eff_fmt != 0 && eff_fmt != res_fmt {
+                patched = Some(default_uav_desc(&rd, eff_fmt));
+            }
+            if eff_fmt != 0 && !super::device_x::pc_typed_uav_supported(this, eff_fmt as i32) {
+                static N: AtomicU64 = AtomicU64::new(0);
+                if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                    crate::xlog_warn!(
+                        "D3D12.X: CreateUnorderedAccessView format {} (resource fmt {}) lacks TYPED_UNORDERED_ACCESS_VIEW support on this GPU – binding null view",
+                        eff_fmt,
+                        rd.Format.0
+                    );
+                }
+                let null_dim = desc.as_ref().map_or_else(|| default_uav_dimension(&rd), |d| d.ViewDimension);
+                let null_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT,
+                    ViewDimension: null_dim,
+                    ..Default::default()
+                };
+                return dev_create_uav_x(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, cpu);
+            }
+            if let Some(ref c) = patched {
+                return dev_create_uav_x(this, res, counter, c as *const _, cpu);
+            }
+        }
+    }
+    dev_create_uav_x(this, res, counter, desc, cpu)
 }
 
 /// #21 CreateDepthStencilView: the console's view formats as the PC's (`pc_view_format`).
@@ -2080,11 +2169,27 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
         return super::console_heap::write(&slot, &[0; 8]);
     }
+    // Placed buffers with `buffer_delta != 0` can have unaligned structured offsets on the PC
+    // backing; write a valid null PC buffer SRV so `slot.pc_srv` and `GLOBAL` never keep a stale
+    // descriptor while translated shaders read the exact UMA address via `buffer_view` below.
+    let buf_delta_null = desc
+        .as_ref()
+        .is_some_and(|v| v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER && buffer_delta(res as usize) != 0);
     // translated shaders declare every cube T# as a TextureCubeArray: a title's TEXTURECUBE
     // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
     let cube = desc.as_ref().and_then(cube_as_cube_array);
     let desc = cube.as_ref().map_or(desc, |v| v as *const _);
-    f(this, res, desc, slot.pc_srv);
+    if buf_delta_null {
+        let null_buf = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        f(this, std::ptr::null_mut(), &null_buf, slot.pc_srv);
+    } else {
+        f(this, res, desc, slot.pc_srv);
+    }
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
     if super::present::trace_frame() && super::title_textures::address(res as usize).is_some() {
