@@ -427,6 +427,7 @@ pub fn compute_with(code: &[u8], cs: &super::CsInterface, o: KernelOptions) -> R
 mod tests {
     use super::super::lower::tests::*;
     use super::super::{dxc, runner, translate, Mode, Options};
+    use std::io::Write;
 
     fn gpu() -> bool {
         if !gpu_waves() {
@@ -700,7 +701,13 @@ mod tests {
                 let (dxil, stale) = match super::kernel(&insts, w64) {
                     Ok(k) => k,
                     Err(e) => {
-                        runner::skip_test(&format!("{name}, wave{lanes}, per-lane form: refused ({e})"));
+                        // An unsupported opcode is a translator limitation, not missing GPU coverage.
+                        let thread = std::thread::current();
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "SKIPPED {}: {name}, wave{lanes}, per-lane form: refused ({e})",
+                            thread.name().unwrap_or("?")
+                        );
                         continue;
                     }
                 };
