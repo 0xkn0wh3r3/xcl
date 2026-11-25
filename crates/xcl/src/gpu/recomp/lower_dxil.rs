@@ -485,6 +485,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn gpu_frexp_exp_f32_denorm_per_lane() {
+        const PRESERVE: I = ("S_DENORM_MODE", "ENC_SOPP", &[("SIMM16", 13)]);
+        const FREXP: I = ("V_FREXP_EXP_I32_F32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)]);
+        let partial = decode(&[
+            ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 144), ("VSRC1", 0)]),
+            ("S_AND_SAVEEXEC_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+            ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]),
+            PRESERVE,
+            ("S_OR_B32", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 126), ("SSRC1", 0)]),
+            FREXP,
+            ENDPGM,
+        ]);
+        let err = super::kernel(&partial, false).unwrap_err();
+        assert!(err.contains("FREXP denormal mode write where some lanes are elsewhere"), "{err}");
+
+        if !gpu() {
+            return;
+        }
+        let (dxil, _) = super::kernel(&decode(&[PRESERVE, FREXP, ENDPGM]), false).unwrap();
+        let mut state = runner::KernelState::default();
+        for v in &mut state.vgpr {
+            v[0] = 1;
+        }
+        let result = runner::run(&dxil, &state, &[]).unwrap();
+        for (lane, v) in result.vgpr.iter().take(32).enumerate() {
+            assert_eq!(v[4] as i32, -148, "lane {lane}");
+        }
+    }
+
     /// An instruction lowered by #1426 that writes to `Lw`'s entry block after the program's
     /// blocks are written (scratch) gives a container, and runs.
     #[test]
