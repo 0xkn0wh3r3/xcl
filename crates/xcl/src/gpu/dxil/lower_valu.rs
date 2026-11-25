@@ -1230,10 +1230,14 @@ impl Lw {
             "f32" => {
                 let a = self.fsrc(m, 0, ua);
                 if opn == "class" {
-                    let cls = self.fclass(a);
-                    let s = self.bin(BinOp::LShr, ub, cls);
-                    let s = self.andc(s, 1);
-                    self.nz(s)
+                    if let Some(k) = self.s.m.const_u64(ub) {
+                        self.fclass_const(a, (k & 0x3FF) as u32)
+                    } else {
+                        let cls = self.fclass(a);
+                        let s = self.bin(BinOp::LShr, ub, cls);
+                        let s = self.andc(s, 1);
+                        self.nz(s)
+                    }
                 } else {
                     let b = self.fsrc(m, 1, ub);
                     self.float_compare(opn, a, b).ok_or_else(|| format!("{}: VOPC f32", rdna2::format(d)))?
