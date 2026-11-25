@@ -7511,6 +7511,43 @@ fn gpu_pknorm_i16_f32_nan_and_fmt_encode_snorm_ufloat() {
 }
 
 #[test]
+fn gpu_fmt_encode_int_sat_and_f16_rtz() {
+    if !gpu_ready() {
+        return;
+    }
+    let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
+    let vs = |base: u32, fmt: u32| [base, 0, 0x100, ident | fmt << 12];
+    let p = prog(&[
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 0), ("SRSRC", 4), ("SOFFSET", 128)], None),  // 16_16_UINT
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 2), ("SRSRC", 5), ("SOFFSET", 128)], None),  // 16_16_SINT
+        ("BUFFER_STORE_FORMAT_XY", "ENC_MUBUF", &[("VDATA", 4), ("SRSRC", 6), ("SOFFSET", 128)], None),  // 16_16_FLOAT
+        ("BUFFER_STORE_FORMAT_XYZ", "ENC_MUBUF", &[("VDATA", 6), ("SRSRC", 7), ("SOFFSET", 128)], None), // 11_11_10_FLOAT
+    ]);
+    let mut st = KernelState::default();
+    st.sgpr[16..20].copy_from_slice(&vs(0x200, 27));
+    st.sgpr[20..24].copy_from_slice(&vs(0x204, 28));
+    st.sgpr[24..28].copy_from_slice(&vs(0x208, 29));
+    st.sgpr[28..32].copy_from_slice(&vs(0x20C, 43));
+    for r in st.vgpr.iter_mut() {
+        r[0] = 70_000u32;
+        r[1] = 65_535u32;
+        r[2] = 40_000i32 as u32;
+        r[3] = (-40_000i32) as u32;
+        r[4] = 65520.0f32.to_bits();
+        r[5] = (-65520.0f32).to_bits();
+        r[6] = 65520.0f32.to_bits();
+        r[7] = f32::INFINITY.to_bits();
+        r[8] = 65520.0f32.to_bits();
+    }
+    let mem = vec![0u32; 0x100];
+    let r = runner::run_code(&p, &st, &mem).unwrap();
+    assert_eq!(r.mem[0x200 / 4], 0xFFFF_FFFF, "16_16_UINT saturates 70000 -> 65535");
+    assert_eq!(r.mem[0x204 / 4], 0x8000_7FFF, "16_16_SINT saturates (40000, -40000)");
+    assert_eq!(r.mem[0x208 / 4], 0xFBFF_7BFF, "16_16_FLOAT saturates finite overflow to max finite");
+    assert_eq!(r.mem[0x20C / 4], 0x3DF | (0x7C0 << 10) | (0x7BF << 21), "11_11_10_FLOAT saturates finite overflow and keeps +inf");
+}
+
+#[test]
 fn gpu_signed_bfe_arithmetic_shift() {
     for wave64 in gpu_waves() {
         let p = prog(&[
