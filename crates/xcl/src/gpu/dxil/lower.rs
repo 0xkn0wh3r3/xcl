@@ -1086,10 +1086,10 @@ impl Lw {
         if sp_mask != 0 && !self.f32_rm {
             return err(d, "dynamic f32 round mode");
         }
-        if self.has_f64_round_op {
+        if dp_mask != 0 && self.has_f64_round_op {
             return err(d, "dynamic f64 round mode");
         }
-        if self.dyn_rm {
+        if dp_mask != 0 && self.dyn_rm {
             let sd = Self::field(d, "SDST");
             let src = self.code32(sd, None, false).ok_or_else(|| format!("{}: register", rdna2::format(d)))?;
             let v = match dp_mask {
