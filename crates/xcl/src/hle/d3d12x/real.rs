@@ -7759,6 +7759,8 @@ mod readback_routing_tests {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    use std::mem::{offset_of, size_of};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Fence_Vtbl;
 
     // a fake adopted queue: the extension vtable's word before slot 0 points at the PC table
     unsafe extern "system" fn get_desc(_: *mut c_void, out: usize) -> usize {
@@ -7769,11 +7771,36 @@ mod queue_tests {
     unsafe extern "system" fn signal(_: *mut c_void, _: usize, _: usize) -> i32 {
         0
     }
+    unsafe extern "system" fn fake_fence_completed(_: *mut c_void) -> u64 {
+        u64::MAX
+    }
+
+    #[repr(C)]
+    struct FakeFence {
+        vtable: *const usize,
+    }
+
+    /// Removes the synthetic fence and queue entries from every global table that
+    /// `queue_dispatch(14, ...)` touches before the stack objects go out of scope.
+    struct Cleanup {
+        fence: usize,
+        queue: usize,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            FENCES.write().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != self.fence);
+            super::super::fence_x::forget_fence_for_test(self.fence);
+            super::super::list_x::forget_title_fence_for_test(self.fence, self.queue);
+            QUEUE_OLDER.store(false, Ordering::Release);
+        }
+    }
 
     /// Queue #18 before the layout is known writes 8 bytes; after a Signal at #14 (the older
     /// layout) it is GetDesc with all 16.
     #[test]
     fn queue_slot_18_before_the_layout_is_known_writes_8_bytes() {
+        const SLOT: usize = size_of::<usize>();
         let mut pc = [0usize; 32];
         pc[14] = signal as usize;
         pc[18] = get_desc as usize;
@@ -7781,7 +7808,14 @@ mod queue_tests {
         let vtbl = ext.as_ptr() as usize + 8;
         let mut obj = [vtbl];
         let this = obj.as_mut_ptr() as *mut c_void;
-        let fence = 0x5EED_0000usize;
+        // A valid minimal ID3D12Fence COM object while registered: if a parallel test inspects
+        // `SYNC_GRAPH.title_fences` before `Cleanup::drop` runs, `GetCompletedValue` succeeds
+        // cleanly instead of dereferencing an unmapped sentinel address.
+        let mut fence_vtbl = [0usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        fence_vtbl[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = fake_fence_completed as usize;
+        let fake_fence = FakeFence { vtable: fence_vtbl.as_ptr() };
+        let fence = (&fake_fence as *const FakeFence) as usize;
+        let _cleanup = Cleanup { fence, queue: this as usize };
         QUEUE_SHIFTED.store(false, Ordering::Release);
         QUEUE_OLDER.store(false, Ordering::Release);
         unsafe {
@@ -7791,13 +7825,11 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 0xAAAA_AAAA, 0xAAAA_AAAA], "only the first 8 bytes");
             FENCES.write().unwrap().push(fence);
             queue_dispatch(14, this, fence, 1, 0, 0);
-            FENCES.write().unwrap().retain(|&f| f != fence);
             assert!(QUEUE_OLDER.load(Ordering::Acquire) && !QUEUE_SHIFTED.load(Ordering::Acquire));
             let mut out = [0xAAAA_AAAAu32; 4];
             queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
-        QUEUE_OLDER.store(false, Ordering::Release);
     }
 
     #[test]
