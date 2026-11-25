@@ -68,6 +68,28 @@ pub(super) struct Em {
     /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
     /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
     safe_barrier: bool,
+    /// the T# SGPRs of the program's image stores and atomics (`image_write_srsrcs`)
+    img_writes: Vec<u64>,
+}
+
+/// The T# SGPRs (SRSRC) of a program's image stores and atomics, at most 16, sorted. An
+/// image_load reads through the UAV (`tw0 + 1`) where the invocation stored to the same image
+/// before (`xcl_iw{srsrc}` holds `tw0 + 1` of the last such store): the SRV need not see a
+/// write of the same dispatch, and RDNA reads its own writes.
+pub fn image_write_srsrcs(insts: &[Decoded]) -> Vec<u64> {
+    let mut v: Vec<u64> = insts
+        .iter()
+        .filter(|d| d.enc.name.starts_with("ENC_MIMG"))
+        .filter(|d| {
+            let n = d.inst.name.to_ascii_lowercase();
+            n.starts_with("image_store") || n.starts_with("image_atomic")
+        })
+        .map(|d| rdna2::field_value(d.enc, &d.words, "SRSRC").unwrap_or(0) * rdna2::register_scale("SRSRC"))
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v.truncate(16);
+    v
 }
 
 /// Instructions without an effect in this execution model.
@@ -594,6 +616,7 @@ impl Em {
             dynamic_f16_rm: false,
             track_frexp_denorm: false,
             safe_barrier: false,
+            img_writes: Vec::new(),
         }
     }
 
@@ -612,6 +635,7 @@ impl Em {
     /// and multi-warp `s_barrier` usage (for early-exit-safe, bounded `xcl_s_barrier`).
     pub fn configure_round_modes(&mut self, insts: &[Decoded], stop_at_endpgm: bool) {
         self.track_frexp_denorm = tracks_frexp_f32_denorm(insts);
+        self.img_writes = image_write_srsrcs(insts);
         let mut writes_nonzero_dp = false;
         let mut has_s_barrier = false;
         for d in insts {
@@ -2849,17 +2873,35 @@ impl Em {
             return Err("image_load cube");
         }
         self.line(&format!("uint {t}_cls = img_cls(({tw1} >> 20) & 0x1FFu);"));
+        if (base.starts_with("store") || base.starts_with("atomic_")) && self.img_writes.contains(&srsrc) {
+            self.line(&format!("if ({t}_ok) xcl_iw{srsrc} = {tw0} + 1u;"));
+        }
         match base {
             "load" | "load_mip" => {
                 self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
                 let ld = if dim == 6 { format!("{t}_T.Load({icoord}, {})", ic.get(2).cloned().unwrap_or("0u".into())) } else { format!("{t}_T.Load({load_arg})") };
                 let tex = |vt: &str| format!("Texture{rty}<{vt}4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})];");
-                self.line(&format!(
-                    "if (and({act}, {t}_ok)) {{ if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }} }}",
+                let srv = format!(
+                    "if ({t}_cls == 1u) {{ {} {t}_r = {ld}; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({ld}); }} else {{ {} {t}_r = asuint({ld}); }}",
                     tex("uint"),
                     tex("int"),
                     tex("float")
-                ));
+                );
+                // an image this invocation stored to: through the UAV, which sees the store (the
+                // SRV need not within a dispatch); image_load only – a UAV view is one mip
+                let rw: Vec<String> = if base == "load" && dim != 6 { self.img_writes.iter().map(|s| format!("xcl_iw{s} == {tw0} + 1u")).collect() } else { Vec::new() };
+                if rw.is_empty() {
+                    self.line(&format!("if (and({act}, {t}_ok)) {{ {srv} }}"));
+                } else {
+                    let uav = |vt: &str| format!("RWTexture{rty}<{vt}4> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];");
+                    self.line(&format!("bool {t}_rw = {};", rw.join(" || ")));
+                    self.line(&format!(
+                        "if (and({act}, {t}_ok)) {{ if ({t}_rw) {{ if ({t}_cls == 1u) {{ {} {t}_r = {t}_U[{icoord}]; }} else if ({t}_cls == 2u) {{ {} {t}_r = asuint({t}_U[{icoord}]); }} else {{ {} {t}_r = asuint({t}_U[{icoord}]); }} }} else {{ {srv} }} }}",
+                        uav("uint"),
+                        uav("int"),
+                        uav("float")
+                    ));
+                }
                 let cls = format!("{t}_cls");
                 let half = move |e: &str| format!("(({cls} == 0u) ? f32tof16(asfloat({e})) : ({e} & 0xFFFFu))");
                 let comps2 = comps.clone();
@@ -4702,6 +4744,9 @@ impl Em {
         }
         if self.track_frexp_denorm {
             h.push_str("static uint xcl_frexp_f32_denorm = 0u;\n");
+        }
+        for s in &self.img_writes {
+            let _ = writeln!(h, "static uint xcl_iw{s} = 0u; // tw0 + 1 of the last image store / atomic through s{s}");
         }
         let mut sg: BTreeSet<u64> = self.sgprs.clone();
         sg.extend([106, 107, 124, 126, 127]);

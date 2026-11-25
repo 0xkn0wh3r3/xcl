@@ -800,6 +800,16 @@ impl Lw {
         let fmt = self.lshrc(tw1, 20);
         let fmt = self.andc(fmt, 0x1FF);
         let cls = self.img_cls(fmt);
+        // an image store / atomic records its T# (`tw0 + 1`): a later image_load of the image
+        // reads through the UAV (`recomp::emit::image_write_srsrcs`)
+        if base.starts_with("store") || base.starts_with("atomic_") {
+            if let Some(k) = self.img_writes.iter().position(|&s| s == srsrc) {
+                let var = super::lower::VAR_IMG_WRITE + k as u32;
+                let (cur, t1) = (self.rd(var), self.addc(tw0, 1));
+                let nv = self.sel(valid, t1, cur);
+                self.wr(var, nv);
+            }
+        }
         if ms {
             return self.mimg_msaa(base, &ic, tw0, lkind, cls, &comps, vdata, d16, act, run);
         }
@@ -810,10 +820,32 @@ impl Lw {
                 for &t in &tmps {
                     self.wr(t, z);
                 }
+                // an image this invocation stored to: through the UAV, which sees the store (the
+                // SRV need not within a dispatch); image_load only – a UAV view is one mip
+                let mut rw = None;
+                if base == "load" && !self.img_writes.is_empty() {
+                    let t1 = self.addc(tw0, 1);
+                    for k in 0..self.img_writes.len() {
+                        let w = self.rd(super::lower::VAR_IMG_WRITE + k as u32);
+                        let e = self.cmp(Pred::Eq, w, t1);
+                        rw = Some(match rw {
+                            Some(r) => self.lor(r, e),
+                            None => e,
+                        });
+                    }
+                }
+                let ui = self.addc(tw0, 1);
                 for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
                     let is = self.cmpc(Pred::Eq, cls, cv);
                     let c = self.land(run, is);
-                    self.guarded(c, &mut |lw| {
+                    let (c_srv, c_uav) = match rw {
+                        Some(r) => {
+                            let nr = self.lnot(r);
+                            (self.land(c, nr), Some(self.land(c, r)))
+                        }
+                        None => (c, None),
+                    };
+                    self.guarded(c_srv, &mut |lw| {
                         let tex: Texture = lw.s.heap_texture(tw0, lkind, false, ct, 4, true);
                         let r = lw.s.texture_load(tex, Some(mip), &ic, &[]);
                         for k in 0..4 {
@@ -822,6 +854,18 @@ impl Lw {
                         }
                         Ok(())
                     })?;
+                    if let Some(cu) = c_uav {
+                        self.guarded(cu, &mut |lw| {
+                            lw.s.typed_uav_load_additional_formats();
+                            let tex: Texture = lw.s.heap_texture(ui, lkind, true, ct, 4, true);
+                            let r = lw.s.texture_load(tex, None, &ic, &[]);
+                            for k in 0..4 {
+                                let b = lw.bits(r[k]);
+                                lw.wr(tmps[k], b);
+                            }
+                            Ok(())
+                        })?;
+                    }
                 }
                 let r: Vec<Value> = tmps.iter().map(|&t| self.rd(t)).collect();
                 let vals: Vec<Value> = if d16 {
