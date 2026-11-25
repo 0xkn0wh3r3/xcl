@@ -97,9 +97,7 @@ pub fn flush() {
     }
 }
 
-/// A panic goes to the log as well as to stderr: a thread of XCL's that dies is gone for the
-/// run, and the log is what a report carries (a retail title's run lost `xcl-sync-watchdog` so,
-/// with nothing in `xcl.log`).
+/// A panic goes to the log as well as to stderr.
 pub fn log_panics() {
     let print = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -123,7 +121,6 @@ macro_rules! xlog_trace { ($($a:tt)*) => { if $crate::log::enabled($crate::log::
 mod tests {
     use super::*;
 
-    /// A thread that panics leaves its name, the place and the message in the log file.
     #[test]
     fn a_panic_is_in_the_log() {
         let path = std::env::temp_dir().join(format!("xcl-log-panics-{}.log", std::process::id()));
