@@ -525,7 +525,6 @@ impl Module {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::gpu::{
         dxil::{kernel::{Entry, KernelOptions}, lower::Lw, module::Pred},
         recomp::{runner, CsInterface},
@@ -542,7 +541,7 @@ mod tests {
         let options = KernelOptions { wave64: split, split, mem_windows: 1, sampler_base: 0 };
         let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
         let (tid, _) = lw.setup_lanes_compute(geometry, false);
-        let mem = lw.s.raw_uav(2, 0);
+        let mem = lw.mems[0];
         let group = lw.s.group_id(0);
         let count = lw.c(threads);
         let base = lw.mul(group, count);
@@ -583,9 +582,11 @@ mod tests {
         lw.s.raw_store(mem, offset, &[value]);
         lw.s.m.ret();
         lw.s.m.optimize();
-        let chain = lw.s.split_compute(geometry, split.then_some(tid), 40).expect("split the synthetic program");
-        assert!(chain.pieces.len() >= 3);
+        let chain = lw.s.split_compute(geometry, split.then_some(tid), 40);
         let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+        crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
+        let chain = chain.expect("split the synthetic program");
+        assert!(chain.pieces.len() >= 3);
         let initial: Vec<_> = (1..=threads * 3).collect();
         let expected: Vec<_> = initial.iter().enumerate().map(|(i, &v)| {
             let n = (i as u32 % 4) + 1;
