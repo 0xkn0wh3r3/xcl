@@ -778,6 +778,8 @@ impl Lw {
                         (e(lw, 0), e(lw, 1), lw.mul(n, k), e(lw, 3))
                     }
                     2 | 5 => (e(lw, 0), e(lw, 1), e(lw, 2), e(lw, 3)),
+                    // a 1D array: RDNA gives its layers in y (and z), as the HLSL path does
+                    4 => (e(lw, 0), e(lw, 1), e(lw, 1), e(lw, 3)),
                     _ => (e(lw, 0), one, e(lw, 1), e(lw, 3)),
                 };
                 for (k, v) in [w, hh, dd, n].into_iter().enumerate() {
