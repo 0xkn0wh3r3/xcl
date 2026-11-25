@@ -6849,8 +6849,8 @@ static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
 
 /// command list slots of the newer layout → the older layout's slot of the same method
 /// (`DispatchMesh` sits at newer #129 after #126 RSSetShadingRate, #127 RSSetShadingRateImage,
-/// and #128 Scarlett-only shading-rate/color struct).
-const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 126), (139, 10)];
+/// and #128 Scarlett-only shading-rate/color struct; older #127, two slots before as the others).
+const NEWER_LIST_SLOTS: [(usize, usize); 22] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (129, 127), (139, 10)];
 
 /// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
 /// records its first lists before any queue call could tell).
@@ -7629,7 +7629,7 @@ mod queue_tests {
 
     #[test]
     fn newer_layout_maps_dispatch_mesh_to_slot_129_not_128() {
-        assert!(NEWER_LIST_SLOTS.contains(&(129, 126)), "DispatchMesh must map to newer slot #129");
+        assert!(NEWER_LIST_SLOTS.contains(&(129, 127)), "DispatchMesh must map to newer slot #129");
         assert!(!NEWER_LIST_SLOTS.iter().any(|&(newer, _)| newer == 128), "newer slot #128 must not map to DispatchMesh");
     }
 }
