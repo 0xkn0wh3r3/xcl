@@ -95,8 +95,11 @@ if ($OutDir) {
         $null = New-Item -ItemType Directory -Path $OutDir -Force
     }
     Copy-Item -LiteralPath $log -Destination (Join-Path $OutDir 'xcl.log') -Force
+    $destReport = Join-Path $OutDir 'report.json'
     if (Test-Path $report) {
-        Copy-Item -LiteralPath $report -Destination (Join-Path $OutDir 'report.json') -Force
+        Copy-Item -LiteralPath $report -Destination $destReport -Force
+    } elseif (Test-Path $destReport) {
+        Remove-Item -LiteralPath $destReport -Force
     }
     $manifest = [ordered]@{
         commit         = $commit

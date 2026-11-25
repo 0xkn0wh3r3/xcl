@@ -52,16 +52,16 @@ exit /b 0
     if ($smokeBlock -notmatch 'xcl-smoke v1') { throw "smoke block missing header: $smokeBlock" }
     if ($smokeBlock -notmatch 'gpu: Mock Synthetic Adapter') { throw "smoke block missing mock gpu: $smokeBlock" }
 
-    # Run 2: remove report.json to test missing report case
+    # Run 2: remove report.json to test missing report case; reuse $outDir1 to verify stale report.json is purged
     Remove-Item -LiteralPath $mockReport -Force
-    $output2 = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 10 -OutDir $outDir2 -Title 'MockRun2'
+    $output2 = & $runner -Game $gameDir -Xcl $mockXcl -Seconds 10 -OutDir $outDir1 -Title 'MockRun2'
     if ($LASTEXITCODE -ne 0) { throw "smoke.ps1 exited with code $LASTEXITCODE on run 2" }
 
-    if (-not (Test-Path (Join-Path $outDir2 'xcl.log'))) { throw 'run 2 did not preserve xcl.log' }
-    if (Test-Path (Join-Path $outDir2 'report.json')) { throw 'run 2 should not have report.json' }
-    if (-not (Test-Path (Join-Path $outDir2 'manifest.json'))) { throw 'run 2 did not write manifest.json' }
+    if (-not (Test-Path (Join-Path $outDir1 'xcl.log'))) { throw 'run 2 did not preserve xcl.log' }
+    if (Test-Path (Join-Path $outDir1 'report.json')) { throw 'run 2 did not clean up stale report.json' }
+    if (-not (Test-Path (Join-Path $outDir1 'manifest.json'))) { throw 'run 2 did not write manifest.json' }
 
-    $manifest2 = Get-Content (Join-Path $outDir2 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
+    $manifest2 = Get-Content (Join-Path $outDir1 'manifest.json') -Raw -Encoding utf8 | ConvertFrom-Json
     if ($manifest2.seconds -ne 10) { throw "unexpected seconds: $($manifest2.seconds)" }
     if ($manifest2.title -ne 'MockRun2') { throw "unexpected title: $($manifest2.title)" }
 
