@@ -5005,11 +5005,26 @@ fn rmw32(op: &str, at: &At, v: &str, v2: &str, old: &str, t: &str) -> Option<Str
         "swap" | "wrxchg_b32" => direct("InterlockedExchange", v),
         "umin" | "min_u32" => direct("InterlockedMin", v),
         "umax" | "max_u32" => direct("InterlockedMax", v),
-        // float compare-swap compares bits (differs only for -0 / NaN)
-        "cmpswap" | "fcmpswap" | "cmpst_b32" | "cmpst_f32" => match at {
+        "cmpswap" | "cmpst_b32" => match at {
             At::Mem(a) => format!("mem.InterlockedCompareExchange({a}, {v2}, {v}, {old});"),
             At::Ref(r) => format!("InterlockedCompareExchange({r}, {v2}, {v}, {old});"),
         },
+        // IEEE-754 float compare-swap: -0.0 == +0.0 swaps, NaN == NaN keeps (XCL-BT-042)
+        "fcmpswap" | "cmpst_f32" => {
+            let (load, cx) = match at {
+                At::Mem(a) => (
+                    format!("mem.InterlockedOr({a}, 0u, {t}_c);"),
+                    format!("mem.InterlockedCompareExchange({a}, {t}_c, {v}, {t}_p);"),
+                ),
+                At::Ref(r) => (
+                    format!("InterlockedOr({r}, 0u, {t}_c);"),
+                    format!("InterlockedCompareExchange({r}, {t}_c, {v}, {t}_p);"),
+                ),
+            };
+            format!(
+                "uint {t}_c = 0u; {load} [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ if (({t}_c & 0x7FFFFFFFu) > 0x7F800000u || ({t}_c != {v2} && (({t}_c | {v2}) & 0x7FFFFFFFu) != 0u)) break; uint {t}_p = 0u; {cx} if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {old} = {t}_c;"
+            )
+        }
         "smin" | "min_i32" => signed("InterlockedMin", "min"),
         "smax" | "max_i32" => signed("InterlockedMax", "max"),
         "fmin" | "fmax" | "min_f32" | "max_f32" => {
@@ -5055,9 +5070,13 @@ fn rmw64(op: &str, a: &str, v: &str, cmp: &str, old: &str, t: &str) -> Option<St
             let f = if op == "smin" { "InterlockedMin64" } else { "InterlockedMax64" };
             return Some(format!("int64_t {t}_s = 0; mem.{f}({a}, (int64_t){v}, {t}_s); {old} = (uint64_t){t}_s;"));
         }
-        // float compare-swap compares the whole 64-bit payload bitwise (like rmw32's
-        // fcmpswap): differs from a numeric f64 compare only for -0 / NaN
-        "cmpswap" | "fcmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
+        "cmpswap" => return Some(format!("mem.InterlockedCompareExchange64({a}, {cmp}, {v}, {old});")),
+        // IEEE-754 f64 compare-swap via pure u64 bitwise checks (no DoubleExtensions needed)
+        "fcmpswap" => {
+            return Some(format!(
+                "uint64_t {t}_c = 0; mem.InterlockedOr64({a}, (uint64_t)0, {t}_c); [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ if (({t}_c & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull || ({t}_c != {cmp} && (({t}_c | {cmp}) & 0x7FFFFFFFFFFFFFFFull) != 0ull)) break; uint64_t {t}_p = 0; mem.InterlockedCompareExchange64({a}, {t}_c, {v}, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {old} = {t}_c;"
+            ));
+        }
         "fmin" | "fmax" => return Some(float_minmax_mem(op == "fmin", true, a, v, old, t)),
         _ => return None,
     };
