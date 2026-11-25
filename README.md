@@ -296,7 +296,7 @@ part of the repository.
 
 Help is welcome – [`CONTRIBUTING.md`](CONTRIBUTING.md) has what a pull request needs, in short: small,
 one problem, tested. Test results on your GPU go to [#42](https://github.com/xcl-dev/xcl/issues/42),
-questions and talk to the [Discord server](https://discord.gg/D7fAUQDRyd).
+questions and talk to the [Discord server](https://discord.gg/xcl).
 
 <p align="center"><img src="assets/readme/divider.svg" width="100%" alt=""></p>
 
