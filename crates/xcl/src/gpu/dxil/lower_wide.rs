@@ -67,6 +67,8 @@ impl Lw {
             "v_dot2_f32_f16" | "v_dot2c_f32_f16" => {
                 let c = if name == "v_dot2_f32_f16" {
                     let c = self.f(src(2));
+                    // SRC2 is f32: its NEG_HI bit is ABS (applied before NEG), as in v_fma_mix*
+                    let c = if neg_hi >> 2 & 1 == 1 { self.fabs(c) } else { c };
                     if neg >> 2 & 1 == 1 {
                         self.fneg(c)
                     } else {
