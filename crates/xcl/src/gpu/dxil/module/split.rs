@@ -28,6 +28,7 @@ pub struct DispatchChain {
 struct Scratch {
     uav: RawUav,
     base: Value,
+    bytes_per_slot: u32,
 }
 
 impl Scratch {
@@ -42,15 +43,17 @@ impl Scratch {
         let row = s.m.bin(BinOp::Add, row, y);
         let first = s.m.bin(BinOp::Mul, row, width);
         let group = s.m.bin(BinOp::Add, first, x);
-        let n = s.m.i32c(threads);
-        let first = s.m.bin(BinOp::Mul, group, n);
+        // Give consecutive logical lanes consecutive words for a slot, including
+        // the continuation tag in slot zero. A workgroup owns all its slots.
+        let group_words = s.m.i32c(stride * threads);
+        let first = s.m.bin(BinOp::Mul, group, group_words);
         let index = s.m.bin(BinOp::Add, first, lane);
-        let bytes = s.m.i32c(stride * 4);
-        Self { uav, base: s.m.bin(BinOp::Mul, index, bytes) }
+        let four = s.m.i32c(4);
+        Self { uav, base: s.m.bin(BinOp::Mul, index, four), bytes_per_slot: threads * 4 }
     }
 
     fn at(&self, m: &mut Module, slot: u32) -> Value {
-        let offset = m.i32c(slot * 4);
+        let offset = m.i32c(slot * self.bytes_per_slot);
         m.bin(BinOp::Add, self.base, offset)
     }
 }
@@ -151,8 +154,10 @@ impl Shader {
                         statics.insert(v);
                         continue;
                     }
-                    let at = scratch.at(&mut dst.m, slot);
-                    let words = dst.raw_load(scratch.uav, at, if n == 2 { 3 } else { 1 });
+                    let words = (slot..slot + n).map(|word| {
+                        let at = scratch.at(&mut dst.m, word);
+                        dst.raw_load(scratch.uav, at, 1)[0]
+                    }).collect();
                     incoming.entry(v).or_default().push((words, bridge));
                     slot += n;
                 }
@@ -244,8 +249,10 @@ impl Shader {
                 let n = src.transport_words(v)?;
                 if n != 0 {
                     let words = src.pack(v, *values.get(&v)?, &mut dst.m);
-                    let at = scratch.at(&mut dst.m, slot);
-                    dst.raw_store(scratch.uav, at, &words);
+                    for (k, word) in words.into_iter().enumerate() {
+                        let at = scratch.at(&mut dst.m, slot + k as u32);
+                        dst.raw_store(scratch.uav, at, &[word]);
+                    }
                     slot += n;
                 }
             }
@@ -526,7 +533,7 @@ impl Module {
 #[cfg(test)]
 mod tests {
     use crate::gpu::{
-        dxil::{kernel::{Entry, KernelOptions}, lower::Lw, module::Pred},
+        dxil::{kernel::{Entry, KernelOptions}, lower::Lw, module::{BinOp, CastOp, Pred}},
         recomp::{runner, CsInterface},
     };
 
@@ -548,6 +555,14 @@ mod tests {
         let index = lw.add(base, tid);
         let offset = lw.shlc(index, 2);
         let original = lw.s.raw_load(mem, offset, 1)[0];
+        // Two different dynamic dwords cross every cut as one i64. With
+        // slot-major scratch the high word is a wave width past the low word.
+        let i64_ty = lw.s.m.i64();
+        let lo = lw.s.m.cast(CastOp::ZExt, original, i64_ty);
+        let hi = lw.s.m.cast(CastOp::ZExt, tid, i64_ty);
+        let shift = lw.s.m.const_int(i64_ty, 32);
+        let hi = lw.s.m.bin(BinOp::Shl, hi, shift);
+        let pair = lw.s.m.bin(BinOp::Or, lo, hi);
         let trips = lw.andc(tid, 3);
         let trips = lw.addc(trips, 1);
         let mut value = original;
@@ -579,6 +594,11 @@ mod tests {
                 value = lw.add(value, other_half);
             }
         }
+        let pair_lo = lw.s.m.cast(CastOp::Trunc, pair, i32);
+        let high = lw.s.m.bin(BinOp::LShr, pair, shift);
+        let pair_hi = lw.s.m.cast(CastOp::Trunc, high, i32);
+        let both = lw.xor(pair_lo, pair_hi);
+        value = lw.add(value, both);
         lw.s.raw_store(mem, offset, &[value]);
         lw.s.m.ret();
         lw.s.m.optimize();
@@ -590,7 +610,7 @@ mod tests {
         let initial: Vec<_> = (1..=threads * 3).collect();
         let expected: Vec<_> = initial.iter().enumerate().map(|(i, &v)| {
             let n = (i as u32 % 4) + 1;
-            v + n * (16 * v + 136) + u32::from(split && i as u32 % threads < 32)
+            v + n * (16 * v + 136) + u32::from(split && i as u32 % threads < 32) + (v ^ (i as u32 % threads))
         }).collect();
         let reference = runner::dispatch(&whole, [3, 1, 1], &[], &initial).unwrap();
         assert_eq!(reference, expected);
