@@ -6269,7 +6269,10 @@ fn bench_split_wave64() {
                 t.sort_by(f64::total_cmp);
                 ms.push(t[t.len() / 2]);
             }
-            let form = if runner::split_wave64() { if threads > 64 { "split, counter-paired" } else { "split, barrier" } } else { "native" };
+            // the form `x64_spin` picks: counters for groups of more than one console wave,
+            // and by default for one as well (`XCL_WAVE64_SPIN=0`: a group barrier)
+            let spin = threads > 64 || std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0");
+            let form = if runner::split_wave64() { if spin { "split, counter-paired" } else { "split, barrier" } } else { "native" };
             println!(
                 "v_cmp + v_cndmask{}: {exchanges} exchange(s) / iteration, {threads} threads per group, 2^18 threads x {iterations} iterations: wave32 {:.1} ms, wave64 ({form}) {:.1} ms = {:.2}x",
                 if readfirstlane { " + v_readfirstlane" } else { "" },
