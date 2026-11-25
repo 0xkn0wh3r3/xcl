@@ -31,8 +31,10 @@ pub(super) struct Em {
     dpp_enable: Option<String>,
     /// PS: interpolation modifier per attribute ("", "centroid", "nointerpolation" …)
     pub ps_modes: BTreeMap<u32, String>,
-    /// PS: an export with DONE was emitted (lanes without it are discarded)
+    /// PS: an export controlling pixel survival (VM=1, or DONE=1 fallback) was emitted
     ps_done: bool,
+    /// PS: program has at least one EXP with VM=1 (pixel survival follows VM rather than DONE)
+    has_ps_vm: bool,
     /// LDS used (compute): declare the groupshared array
     uses_lds: bool,
     /// scratch_* used: declare the per-lane private memory
@@ -553,6 +555,7 @@ impl Em {
             dpp_enable: None,
             ps_modes: BTreeMap::new(),
             ps_done: false,
+            has_ps_vm: false,
             uses_lds: false,
             uses_scratch: false,
             x64_words: 1,
@@ -592,6 +595,9 @@ impl Em {
             }
             if name == "s_barrier" {
                 has_s_barrier = true;
+            }
+            if matches!(self.opt.mode, Mode::Pixel(_)) && d.enc.name == "ENC_EXP" && rdna2::field_value(d.enc, &d.words, "VM") == Some(1) {
+                self.has_ps_vm = true;
             }
             if is_f16_rounded_op(&name) {
                 self.has_f16_round_op = true;
@@ -2213,6 +2219,7 @@ impl Em {
     fn export_graphics(&mut self, d: &Decoded, en: u64, tgt: u64, compr: bool, srcs: &[String]) -> Result<(), &'static str> {
         let act = self.act();
         let done = rdna2::field_value(d.enc, &d.words, "DONE") == Some(1);
+        let vm = rdna2::field_value(d.enc, &d.words, "VM") == Some(1);
         let enabled = |c: usize| if compr { en >> (c / 2 * 2) & 3 != 0 } else { en >> c & 1 == 1 };
         let mut st = Vec::new();
         match (&self.opt.mode, tgt) {
@@ -2247,27 +2254,23 @@ impl Em {
                 }
             }
             (Mode::Pixel(ps), 0..=7) => {
-                let Some(e) = ps.outputs.iter().find(|e| e.system_value == 64 && e.index as u64 == tgt) else {
+                if let Some(e) = ps.outputs.iter().find(|e| e.system_value == 64 && e.index as u64 == tgt) {
+                    for c in 0..4 {
+                        if !enabled(c) {
+                            continue;
+                        }
+                        let raw = Self::exp_comp(srcs, compr, c);
+                        let v = match (e.component_type, compr) {
+                            (3, true) => format!("f16tof32({raw})"),
+                            (3, false) => format!("asfloat({raw})"),
+                            (2, true) => format!("(((int)({raw} << 16)) >> 16)"),
+                            (2, false) => format!("(int){raw}"),
+                            (_, _) => raw,
+                        };
+                        st.push(format!("xo.t{tgt}[{c}] = {v};"));
+                    }
+                } else {
                     self.line("/* export to an undeclared SV_Target */");
-                    if done {
-                        self.ps_done = true;
-                        self.line(&format!("if ({act}) xcl_live = true;"));
-                    }
-                    return Ok(());
-                };
-                for c in 0..4 {
-                    if !enabled(c) {
-                        continue;
-                    }
-                    let raw = Self::exp_comp(srcs, compr, c);
-                    let v = match (e.component_type, compr) {
-                        (3, true) => format!("f16tof32({raw})"),
-                        (3, false) => format!("asfloat({raw})"),
-                        (2, true) => format!("(((int)({raw} << 16)) >> 16)"),
-                        (2, false) => format!("(int){raw}"),
-                        (_, _) => raw,
-                    };
-                    st.push(format!("xo.t{tgt}[{c}] = {v};"));
                 }
             }
             (Mode::Pixel(ps), 8) => {
@@ -2308,9 +2311,16 @@ impl Em {
         if !st.is_empty() {
             self.line(&format!("if ({act}) {{ {} }}", st.join(" ")));
         }
-        if done && matches!(self.opt.mode, Mode::Pixel(_)) {
-            self.ps_done = true;
-            self.line(&format!("if ({act}) xcl_live = true;"));
+        if matches!(self.opt.mode, Mode::Pixel(_)) {
+            if self.has_ps_vm {
+                if vm {
+                    self.ps_done = true;
+                    self.line(&format!("xcl_live = ({act});"));
+                }
+            } else if done {
+                self.ps_done = true;
+                self.line(&format!("if ({act}) xcl_live = true;"));
+            }
         }
         Ok(())
     }

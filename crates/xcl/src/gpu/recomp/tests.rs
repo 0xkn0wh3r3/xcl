@@ -1693,6 +1693,142 @@ fn gpu_graphics_vs_ps_draw() {
     }
 }
 
+/// Build the four pixel-shader `EXP` `VM` test cases for XCL-BT-012 (#1488):
+/// (name, code, uses_vm_semantics). Each shades `x >= 8` as `(0.4, 0.6, 0.4, 1.0)` and
+/// discards `x < 8`.
+fn ps_exp_vm_cases() -> [(&'static str, Vec<u8>, bool); 4] {
+    let setup = [
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)][..], None), // save entry EXEC
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 255)], Some(0.4f32.to_bits())),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 255)], Some(0.6f32.to_bits())),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 255)], Some(0.4f32.to_bits())),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 242)], None),
+    ];
+    let narrow = ("V_CMPX_LT_F32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 2)][..], Some(8.0f32.to_bits()));
+    let restore = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 0)][..], None);
+    let build = |tail: &[(&str, &str, &[(&str, u64)], Option<u32>)]| {
+        let mut all = setup.to_vec();
+        all.extend_from_slice(tail);
+        prog(&all)
+    };
+    [
+        // A: VM=1 DONE=0 under narrowed EXEC, then restored EXEC + VM=0 DONE=1 must not revive x < 8.
+        ("vm1_done0_then_vm0_done1", build(&[
+            narrow,
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("VM", 1)], None),
+            restore,
+            ("EXP", "ENC_EXP", &[("TGT", 9), ("EN", 0), ("DONE", 1)], None),
+        ]), true),
+        // B: Two VM=1 exports, second narrower — must overwrite (not OR) the earlier VM=1 mask.
+        ("two_vm1_second_narrower_overwrites", build(&[
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("VM", 1)], None),
+            narrow,
+            ("EXP", "ENC_EXP", &[("TGT", 9), ("EN", 0), ("VM", 1)], None),
+            restore,
+            ("EXP", "ENC_EXP", &[("TGT", 9), ("EN", 0), ("DONE", 1)], None),
+        ]), true),
+        // C: Undeclared MRT1 export with VM=1 DONE=0 followed by restored EXEC + MRT0 VM=0 DONE=1.
+        ("undeclared_mrt_vm1_done0_then_mrt0_vm0_done1", build(&[
+            narrow,
+            ("EXP", "ENC_EXP", &[("TGT", 1), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("VM", 1)], None),
+            restore,
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)], None),
+        ]), true),
+        // D: Legacy synthetic shader with zero VM=1 exports falls back to DONE=1.
+        ("no_vm_falls_back_to_done1", build(&[
+            narrow,
+            ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)], None),
+        ]), false),
+    ]
+}
+
+/// CPU check for XCL-BT-012 (#1488): pixel-shader `EXP` `VM` codegen in HLSL (`emit.rs`)
+/// and container validation in Direct DXIL (`dxil/lower_gfx.rs`).
+#[test]
+fn ps_exp_vm_hlsl_and_direct_dxil_codegen() {
+    use super::PsInterface;
+    use crate::gpu::dxil::kernel::{translate_pixel, KernelOptions};
+    let psi = PsInterface {
+        inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)],
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x302,
+        attrs: None,
+    };
+    let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
+    for (name, ps_code, has_vm) in ps_exp_vm_cases() {
+        let pt = translate(&ps_code, &po).unwrap();
+        assert!(pt.complete(), "{name}: {:?}", pt.unsupported);
+        assert!(pt.hlsl.contains("if (!xcl_live) discard;"), "{name}: missing discard:\n{}", pt.hlsl);
+        if has_vm {
+            assert!(pt.hlsl.contains("xcl_live = ("), "{name}: VM=1 must overwrite xcl_live:\n{}", pt.hlsl);
+            assert!(!pt.hlsl.contains("xcl_live = true;"), "{name}: VM=0 DONE=1 must not OR-set xcl_live:\n{}", pt.hlsl);
+        } else {
+            assert!(pt.hlsl.contains("xcl_live = true;"), "{name}: no-VM fallback must keep DONE=1:\n{}", pt.hlsl);
+        }
+        if super::dxc::location().is_ok() {
+            super::dxc::compile(&pt.hlsl, "main", "ps_6_6", &[]).unwrap_or_else(|e| panic!("{name} DXC: {e}\n{}", pt.hlsl));
+            let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+            let dxil = translate_pixel(&ps_code, ko, &psi).unwrap_or_else(|e| panic!("{name} direct DXIL: {e}")).dxil;
+            crate::gpu::dxil::validate::validate(&dxil).unwrap_or_else(|e| panic!("{name} DXIL validate: {e}"));
+        }
+    }
+}
+
+/// GPU draw regression for XCL-BT-012 (#1488): verifies all four `EXP` `VM` pixel-survival
+/// cases on the GPU through both the HLSL and Direct DXIL pixel-shader backends.
+#[test]
+fn gpu_ps_exp_vm_controls_pixel_survival() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{PsInterface, VsInterface};
+    use crate::gpu::dxil::kernel::{translate_pixel, translate_vertex, KernelOptions};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32_FLOAT;
+    let vs_code = prog(&[
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", V + 4)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V + 5)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 242)], None),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 0), ("VSRC1", 1), ("VSRC2", 2), ("VSRC3", 3), ("DONE", 1)], None),
+    ]);
+    let vsi = VsInterface {
+        inputs: vec![el("POSITION", 0, 0, 3, 0, 3)],
+        outputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)],
+        attr_base: 4,
+        params: None,
+    };
+    let psi = PsInterface {
+        inputs: vec![el("SV_Position", 0, 1, 3, 0, 0xF)],
+        outputs: vec![el("SV_Target", 0, 64, 3, 0, 0xF)],
+        input_ena: 0x302,
+        attrs: None,
+    };
+    let vo = Options { mode: Mode::Vertex(vsi.clone()), wave64: true, ..Default::default() };
+    let po = Options { mode: Mode::Pixel(psi.clone()), wave64: true, ..Default::default() };
+    let ko = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let vs_hlsl = super::dxc::compile(&translate(&vs_code, &vo).unwrap().hlsl, "main", "vs_6_6", &[]).unwrap();
+    let vs_dxil = translate_vertex(&vs_code, ko, &vsi).unwrap().dxil;
+    let verts = [-1.0f32, -1.0, -1.0, 3.0, 3.0, -1.0];
+    let layout = [runner::VertexElement { semantic: "POSITION", index: 0, format: DXGI_FORMAT_R32G32_FLOAT, offset: 0 }];
+    let clear = [0.0, 0.0, 1.0, 1.0];
+    let shaded = [0.4, 0.6, 0.4, 1.0];
+
+    for (name, ps_code, _) in ps_exp_vm_cases() {
+        let ps_hlsl = super::dxc::compile(&translate(&ps_code, &po).unwrap().hlsl, "main", "ps_6_6", &[]).unwrap();
+        let ps_dxil = translate_pixel(&ps_code, ko, &psi).unwrap().dxil;
+        for (backend, vs, ps) in [("hlsl", &vs_hlsl, &ps_hlsl), ("direct_dxil", &vs_dxil, &ps_dxil)] {
+            let px = runner::draw(vs, ps, &layout, &verts, 8, &[], &[], 16, clear).unwrap();
+            for y in 0..16 {
+                for x in 0..16 {
+                    let want = if x >= 8 { shaded } else { clear };
+                    let got = px[y * 16 + x];
+                    assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "{name} ({backend}) pixel ({x},{y}) = {got:?}, expected {want:?}");
+                }
+            }
+        }
+    }
+}
+
 /// `emit::rect_list_gs` declares the VS's output struct; the fourth vertex is v[0] with its
 /// float outputs continued from the other three, its integer (flat) ones left as v[0]'s.
 #[test]
