@@ -664,4 +664,122 @@ mod tests {
 
     #[test]
     fn dispatch_chain_wave64_live_loops_and_exchange() { compare(64); }
+    /// Early exits and forward skips retain their own continuation tags; group
+    /// indexing must keep every lane separate across all three dispatch axes.
+    #[test]
+    fn dispatch_chain_divergent_forward_edges_3d() {
+        if !runner::wave32_supported().unwrap_or(false) {
+            runner::skip_test("no wave32 GPU");
+            return;
+        }
+        println!("CHAIN_GPU={}", runner::adapter().unwrap());
+        for threads in [32, 64] {
+            let geometry = [threads, 1, 1];
+            let split = threads == 64;
+            let cs = CsInterface { threads: geometry, ..Default::default() };
+            let options = KernelOptions { wave64: split, split, mem_windows: 1, sampler_base: 0 };
+            let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+            let (tid, _) = lw.setup_lanes_compute(geometry, false);
+            let mem = lw.mems[0];
+            let [x, y, z] = [0, 1, 2].map(|axis| lw.s.group_id(axis));
+            let three = lw.c(3);
+            let row = lw.mul(z, three);
+            let row = lw.add(row, y);
+            let row = lw.shlc(row, 1);
+            let group = lw.add(row, x);
+            let count = lw.c(threads);
+            let base = lw.mul(group, count);
+            let index = lw.add(base, tid);
+            let offset = lw.shlc(index, 2);
+            let original = lw.s.raw_load(mem, offset, 1)[0];
+            let mode = lw.andc(tid, 3);
+            let trips = lw.addc(mode, 1);
+            let zero = lw.c(0);
+            let one = lw.c(1);
+            let i32 = lw.s.m.i32();
+            let early = lw.s.m.new_block();
+            let choose = lw.s.m.new_block();
+            let first = lw.s.m.new_block();
+            let middle = lw.s.m.new_block();
+            let second = lw.s.m.new_block();
+            let done = lw.s.m.new_block();
+            let exits = lw.cmp(Pred::Eq, mode, zero);
+            lw.s.m.cond_br(exits, early, choose);
+            lw.s.m.set_block(early);
+            let marker = lw.addc(index, 100_000);
+            lw.s.raw_store(mem, offset, &[marker]);
+            lw.s.m.ret();
+            lw.s.m.set_block(choose);
+            let skips = lw.cmp(Pred::Eq, mode, one);
+            lw.s.m.cond_br(skips, middle, first);
+            lw.s.m.set_block(first);
+            let mut value = original;
+            let mut middle_value = None;
+            for round in 1..=16 {
+                if round == 9 {
+                    let previous = lw.cur();
+                    lw.s.m.br(middle);
+                    lw.s.m.set_block(middle);
+                    let joined = lw.s.m.phi(i32);
+                    lw.s.m.add_incoming(joined, original, choose);
+                    lw.s.m.add_incoming(joined, value, previous);
+                    value = joined;
+                    middle_value = Some(joined);
+                    let stops = lw.cmp(Pred::Eq, mode, three);
+                    lw.s.m.cond_br(stops, done, second);
+                    lw.s.m.set_block(second);
+                }
+                let pred = lw.cur();
+                let body = lw.s.m.new_block();
+                let exit = lw.s.m.new_block();
+                lw.s.m.br(body);
+                lw.s.m.set_block(body);
+                let counter = lw.s.m.phi(i32);
+                let acc = lw.s.m.phi(i32);
+                lw.s.m.add_incoming(counter, zero, pred);
+                lw.s.m.add_incoming(acc, value, pred);
+                let next = lw.addc(counter, 1);
+                value = lw.add(acc, original);
+                value = lw.addc(value, round);
+                lw.s.m.add_incoming(counter, next, body);
+                lw.s.m.add_incoming(acc, value, body);
+                let again = lw.cmp(Pred::ULt, next, trips);
+                lw.s.m.cond_br(again, body, exit);
+                lw.s.m.set_block(exit);
+            }
+            let last = lw.cur();
+            lw.s.m.br(done);
+            lw.s.m.set_block(done);
+            let final_value = lw.s.m.phi(i32);
+            lw.s.m.add_incoming(final_value, middle_value.unwrap(), middle);
+            lw.s.m.add_incoming(final_value, value, last);
+            lw.s.raw_store(mem, offset, &[final_value]);
+            lw.s.m.ret();
+            lw.s.m.optimize();
+            let plan = lw.s.m.dispatch_plan(64).expect("partition branch fixture");
+            let stage = |b| plan.blocks.iter().position(|blocks| blocks.contains(&b)).unwrap();
+            assert!(plan.edges.iter().any(|edge| stage(edge.to) > stage(edge.from) + 1), "exercise a forward skip over an intermediate piece");
+            let chain = lw.s.split_compute(geometry, split.then_some(tid), 64).expect("split branch fixture");
+            assert!(chain.pieces.len() >= 3);
+            let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
+            crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
+            let words = (threads * 12) as usize;
+            let initial: Vec<_> = (0..words + 16).map(|i| if i < words { i as u32 + 17 } else { 0xdeadbeef }).collect();
+            let expected: Vec<_> = initial.iter().enumerate().map(|(i, &v)| {
+                if i >= words { return v; }
+                match i as u32 % 4 {
+                    0 => 100_000 + i as u32,
+                    1 => v + 2 * (8 * v + 100),
+                    2 => v + 3 * (16 * v + 136),
+                    _ => v + 4 * (8 * v + 36),
+                }
+            }).collect();
+            let reference = runner::dispatch(&whole, [2, 3, 2], &[], &initial).unwrap();
+            assert_eq!(reference, expected, "unsplit {threads}");
+            let result = runner::dispatch_split(&chain, [2, 3, 2], &initial).unwrap();
+            assert_eq!(result, expected, "split {threads}");
+            println!("CHAIN_BRANCH threads={threads} pieces={} scratch_words_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
+        }
+    }
+
 }
