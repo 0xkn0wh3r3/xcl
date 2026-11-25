@@ -771,11 +771,14 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if matches!(format, 116 | 117) {
         d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
     }
-    // B5G5R5A1 / B4G4R4A4 targets: not ones a PC driver takes for rendering together with
-    // unordered access (a retail game's 2560x1440 one, flags 0x5: E_INVALIDARG) – R8G8B8A8, the
-    // same values with more bits; the GPU's own (nothing of the CPU's is laid out for them)
-    if matches!(format, 86 | 115) && flags & 5 != 0 {
+    // B5G5R5A1 / B4G4R4A4 targets (and B5G6R5 UAVs): not ones a PC driver takes for rendering
+    // or unordered access – R8G8B8A8 holds the same values with full PC RTV/UAV/SRV support.
+    if (matches!(format, 86 | 115) && flags & 5 != 0) || (format == 85 && flags & 4 != 0) {
         d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+    }
+    // B8G8R8X8_UNORM UAVs: PC D3D12 forbids ALLOW_UNORDERED_ACCESS on format 88 – promote to B8G8R8A8_UNORM (87).
+    if format == 88 && flags & 4 != 0 {
+        d[0x20..0x24].copy_from_slice(&87u32.to_le_bytes());
     }
     // R9G9B9E5_SHAREDEXP targets / UAVs: PC D3D12 forbids ALLOW_RENDER_TARGET and
     // ALLOW_UNORDERED_ACCESS on format 67 (Series S 1920x1080 target, flags 0x300005:
@@ -877,12 +880,53 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         // R32_TYPELESS, R16_TYPELESS
         (39 | 40, 0 | 39 | 40) => 41,
         (53 | 55, 0 | 53 | 55) => 56,
-        // a target made R8G8B8A8 (`pc_resource_desc`)
-        (28, 86 | 115) => 28,
+        // a target made R8G8B8A8 / B8G8R8A8 (`pc_resource_desc`)
+        (28, 85 | 86 | 115) => 28,
+        (87, 88) => 87,
         // a target made R11G11B10_FLOAT (`pc_resource_desc`)
         (26, 67) => 26,
         (_, v) => v,
     }
+}
+
+/// Cached host `D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW` answers per `(adapter LUID, DXGI_FORMAT)`.
+static TYPED_UAV_SUPPORT: Mutex<Option<HashMap<((u32, i32), i32), bool>>> = Mutex::new(None);
+
+/// Map sRGB formats (never valid for PC UAVs) to their linear UAV-capable counterparts.
+pub fn pc_uav_linear_format(fmt: u32) -> u32 {
+    match fmt {
+        29 => 28, // R8G8B8A8_UNORM_SRGB -> R8G8B8A8_UNORM
+        91 => 87, // B8G8R8A8_UNORM_SRGB -> B8G8R8A8_UNORM
+        93 => 87, // B8G8R8X8_UNORM_SRGB -> B8G8R8A8_UNORM
+        f => f,
+    }
+}
+
+/// Whether the host D3D12 device supports typed UAV views (`D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW`)
+/// for `fmt`. Queries `CheckFeatureSupport` once per `(adapter LUID, fmt)` and caches the answer.
+pub(super) unsafe fn pc_typed_uav_supported(dev_raw: *mut c_void, fmt: i32) -> bool {
+    if dev_raw.is_null() || fmt <= 0 {
+        return true;
+    }
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&dev_raw) else {
+        return true;
+    };
+    let luid = dev.GetAdapterLuid();
+    let key = ((luid.LowPart, luid.HighPart), fmt);
+    if let Some(&cached) = TYPED_UAV_SUPPORT.lock().unwrap().as_ref().and_then(|m| m.get(&key)) {
+        return cached;
+    }
+    let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(fmt),
+        ..Default::default()
+    };
+    let supported = if dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut data as *mut _ as *mut c_void, std::mem::size_of_val(&data) as u32).is_err() {
+        true
+    } else {
+        data.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    };
+    TYPED_UAV_SUPPORT.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, supported);
+    supported
 }
 
 /// Whether a shader view in `pc_shader_view_format`'s format reads the stencil (plane 1 on the PC).
@@ -1466,5 +1510,29 @@ mod tests {
         assert_eq!(allocation_of([(K64, K64), (u64::MAX, 0), (M4, M4)], |_, _, _, _| placed += 1), (u64::MAX, K64));
         assert_eq!(placed, 1);
         assert_eq!(allocation_of(std::iter::empty(), |_, _, _, _| {}), (0, 0));
+    }
+
+    #[test]
+    fn uav_format_promotion_and_linearization() {
+        let mut x = [0u8; 0x38];
+        x[0] = 3; // texture 2D
+        let desc = |x: &[u8; 0x38]| {
+            let d = pc_resource_desc(x);
+            (u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()))
+        };
+        x[0x20] = 85; // B5G6R5_UNORM + ALLOW_UNORDERED_ACCESS
+        x[0x30..0x34].copy_from_slice(&0x4u32.to_le_bytes());
+        assert_eq!(desc(&x), (28, 4), "B5G6R5 UAV promotes to R8G8B8A8_UNORM");
+        x[0x20] = 88; // B8G8R8X8_UNORM + ALLOW_UNORDERED_ACCESS
+        assert_eq!(desc(&x), (87, 4), "B8G8R8X8 UAV promotes to B8G8R8A8_UNORM");
+        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // sampled-only B8G8R8X8 keeps its native format
+        assert_eq!(desc(&x), (88, 0));
+        assert_eq!(pc_shader_view_format(28, 85), 28);
+        assert_eq!(pc_shader_view_format(28, 115), 28);
+        assert_eq!(pc_shader_view_format(87, 88), 87);
+        assert_eq!(pc_uav_linear_format(29), 28);
+        assert_eq!(pc_uav_linear_format(91), 87);
+        assert_eq!(pc_uav_linear_format(93), 87);
+        assert_eq!(pc_uav_linear_format(28), 28);
     }
 }
