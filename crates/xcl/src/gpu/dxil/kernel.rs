@@ -65,6 +65,13 @@ pub fn translate(code: &[u8], o: KernelOptions) -> Result<Vec<u8>, String> {
 pub struct Kernel {
     pub dxil: Vec<u8>,
     pub static_samplers: Vec<([u32; 4], bool)>,
+    pub dispatch_chain: Option<std::sync::Arc<DispatchChain>>,
+}
+
+pub use super::module::split::DispatchChain;
+
+pub fn dispatch_piece_limit() -> usize {
+    std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
 }
 
 /// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset leaves it to `compact::wanted`.
@@ -197,6 +204,7 @@ fn translate_on_this_thread(
     let uses_lds = lw.lds.is_some();
     let res = lw.res;
     let io = lw.init.io.expect("the I/O buffer");
+    let mut split_tid = None;
     let numthreads = match &entry {
         Entry::Kernel => {
             lw.setup_lanes();
@@ -209,6 +217,7 @@ fn translate_on_this_thread(
         }
         Entry::Compute(cs) => {
             let (tid, gtid) = lw.setup_lanes_compute(cs.threads, uses_lds);
+            if split && !uses_lds && cs.threads == [64, 1, 1] { split_tid = Some(tid); }
             compute_init(&mut lw, cs, tid, gtid);
             cs.threads
         }
@@ -422,7 +431,8 @@ fn translate_on_this_thread(
     lw.s.m.set_block(Block(0));
     lw.s.m.br(h0);
     let hw = if split || !o.wave64 { 32 } else { 64 };
-    lw.finish(numthreads, hw)
+    let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
+    lw.finish_dispatch(numthreads, hw, limit, split_tid)
 }
 
 /// True when a pixel shader uses RDNA2 Primitive Ordered Pixel Shading (POPS):
@@ -588,15 +598,24 @@ impl Lw {
     /// The finished container and the static samplers the program bound, once every block
     /// is closed: `numthreads` and the hardware wave size `hw` for a compute-like entry, the
     /// stage's I/O for a VS / PS.
-    pub fn finish(mut self, numthreads: [u32; 3], hw: u32) -> Result<Kernel, String> {
+    pub fn finish(self, numthreads: [u32; 3], hw: u32) -> Result<Kernel, String> {
+        self.finish_dispatch(numthreads, hw, 0, None)
+    }
+
+    fn finish_dispatch(mut self, numthreads: [u32; 3], hw: u32, limit: usize, split_tid: Option<Value>) -> Result<Kernel, String> {
         if let Some(e) = self.exchange_error.take() {
             return Err(e);
         }
         let stage = self.s.stage;
+        let mut dispatch_chain = None;
         let c = if matches!(stage, Stage::Vertex | Stage::Pixel) {
             let g = self.gfx.take().ok_or("graphics entry without graphics I/O")?;
             let info = if stage == Stage::Pixel { super::graphics::StageInfo::Pixel { early_depth_stencil: false } } else { super::graphics::StageInfo::Vertex };
             self.s.try_finish_graphics(g.io, info)
+        } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
+            self.s.m.optimize();
+            dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+            self.s.finish_optimized(numthreads, Some(hw))
         } else {
             self.s.try_finish(numthreads, Some(hw))
         }
@@ -607,7 +626,7 @@ impl Lw {
                 return Err(format!("direct DXIL failed validation: {e}\n--- disassembly ---\n{dis}"));
             }
         }
-        Ok(Kernel { dxil: c, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect() })
+        Ok(Kernel { dxil: c, static_samplers: self.static_used.iter().map(|&(w, c, _)| (w, c)).collect(), dispatch_chain })
     }
 }
 
