@@ -3544,6 +3544,11 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso)).unwrap();
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        // The ABI root signature indexes both heaps directly, so they must be bound before it.
+        let heap = |ty| -> ID3D12DescriptorHeap {
+            dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: 1, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 }).unwrap()
+        };
+        let heaps = [Some(heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)), Some(heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))];
 
         // User SGPRs: s[0:1] = 64-bit arg_table (Window 3), s4 = 32-bit descriptor table offset in Window 0
         let mut io = vec![0u32; crate::gpu::recomp::KERNEL_SGPRS];
@@ -3559,6 +3564,7 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
                 alloc.Reset().unwrap();
                 list.Reset(&alloc, Some(&pso)).unwrap();
             }
+            list.SetDescriptorHeaps(&heaps);
             list.SetComputeRootSignature(&rs);
             list.SetComputeRootUnorderedAccessView(0, crate::hle::d3d12x::real::uma_va_of(io_buf).unwrap());
             list.SetComputeRootUnorderedAccessView(1, crate::hle::d3d12x::real::uma_va_of(res_buf).unwrap());
