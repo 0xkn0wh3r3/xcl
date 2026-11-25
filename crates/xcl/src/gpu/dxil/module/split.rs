@@ -2,7 +2,7 @@
 //! jump back to an earlier dispatch, so a strongly connected component is
 //! indivisible. Each crossing edge has its own compact state layout.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::{BinOp, Block, CastOp, Module, Op, TypeDef, Value};
 use crate::gpu::dxil::shader::{Feature, RawUav, Shader};
@@ -105,19 +105,24 @@ impl Shader {
             if exchange != 0 { return None; }
         }
         let plan = self.m.dispatch_plan(limit)?;
-        let mut stride = 1;
-        for edge in &plan.edges {
-            let mut words = 1;
-            for &v in &edge.live {
-                words += self.m.transport_words(v)?;
+        // Slot zero is the tag. Every transported SSA value owns its payload slots
+        // until the chain finishes. An outgoing store can never overwrite a value
+        // restored by the same piece, even when the restore is sunk past a branch.
+        let mut stride = 1u32;
+        let mut slots = BTreeMap::new();
+        for value in plan.edges.iter().flat_map(|e| e.live.iter().copied()).collect::<BTreeSet<_>>() {
+            let words = self.m.transport_words(value)?;
+            if words != 0 {
+                slots.insert(value, stride);
+                stride = stride.checked_add(words)?;
             }
-            stride = stride.max(words);
         }
-        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, threads, &prefix)).collect::<Option<Vec<_>>>()?;
+        stride.checked_mul(threads[0])?.checked_mul(4)?;
+        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, &prefix)).collect::<Option<Vec<_>>>()?;
         Some(DispatchChain { pieces, dwords_per_group: stride.checked_mul(threads[0])? })
     }
 
-    fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, threads: [u32; 3], prefix: &[u32]) -> Option<Vec<u8>> {
+    fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, slots: &BTreeMap<Value, u32>, threads: [u32; 3], prefix: &[u32]) -> Option<Vec<u8>> {
         let src = &self.m;
         let mut dst = self.dispatch_piece();
         let mut values = HashMap::new();
@@ -133,10 +138,8 @@ impl Shader {
         let mut hops = HashMap::new();
         let mut exits = HashMap::new();
         let mut cases = Vec::new();
-        let mut paths = Vec::new();
-        let mut incoming = std::collections::BTreeMap::<Value, Vec<(Vec<Value>, Block)>>::new();
-        let mut statics = BTreeSet::new();
-        let merge = dst.m.new_block();
+        let mut deferred = BTreeMap::new();
+        let mut incoming = BTreeSet::new();
         let done = dst.m.new_block();
         let selector = if stage != 0 { Some(dst.raw_load(scratch.uav, scratch.base, 1)[0]) } else { None };
         for (index, edge) in plan.edges.iter().enumerate() {
@@ -145,57 +148,27 @@ impl Shader {
                 exits.insert((edge.from, edge.to), (dst.m.new_block(), tag));
             }
             if let Some(&target) = local.get(&edge.to) {
-                let bridge = dst.m.new_block();
-                dst.m.set_block(bridge);
-                let mut slot = 1;
-                for &v in &edge.live {
-                    let n = src.transport_words(v)?;
-                    if n == 0 {
-                        statics.insert(v);
-                        continue;
-                    }
-                    let words = (slot..slot + n).map(|word| {
-                        let at = scratch.at(&mut dst.m, word);
-                        dst.raw_load(scratch.uav, at, 1)[0]
-                    }).collect();
-                    incoming.entry(v).or_default().push((words, bridge));
-                    slot += n;
-                }
-                dst.m.br(merge);
+                incoming.extend(edge.live.iter().copied());
                 let hop = dst.m.new_block();
                 dst.m.set_block(hop);
                 dst.m.br(target);
-                cases.push((tag, bridge));
-                paths.push((bridge, tag, hop));
+                cases.push((tag, hop));
                 hops.insert((edge.from, edge.to), hop);
             }
         }
         dst.m.set_block(Block(0));
         if let Some(sel) = selector {
-            dst.m.switch(sel, done, &cases);
-            dst.m.set_block(merge);
-            let word = dst.m.i32();
-            let mut unpack = Vec::new();
-            for (original, inc) in incoming {
-                let mut words = Vec::new();
-                for k in 0..inc[0].0.len() {
-                    let phi = dst.m.phi(word);
-                    for &(pred, _, _) in &paths {
-                        let v = inc.iter().find(|p| p.1 == pred).map(|p| p.0[k]).unwrap_or_else(|| dst.m.undef(word));
-                        dst.m.add_incoming(phi, v, pred);
-                    }
-                    words.push(phi);
+            for v in incoming {
+                if values.contains_key(&v) { continue; }
+                if slots.contains_key(&v) {
+                    let id = dst.m.detached_phi(src.insts[inst(v)?].ty);
+                    deferred.insert(id, v);
+                    values.insert(v, id);
+                } else {
+                    src.rebuild_static(v, &mut dst.m, &mut values)?;
                 }
-                unpack.push((original, words));
             }
-            for (original, words) in unpack {
-                values.insert(original, src.unpack(original, &words, &mut dst.m));
-            }
-            for handle in statics {
-                src.rebuild_static(handle, &mut dst.m, &mut values)?;
-            }
-            let routes: Vec<_> = paths.iter().map(|&(_, tag, hop)| (tag, hop)).collect();
-            dst.m.switch(sel, done, &routes);
+            dst.m.switch(sel, done, &cases);
         } else {
             dst.m.br(local[&Block(0)]);
         }
@@ -244,21 +217,23 @@ impl Shader {
         for edge in &plan.edges {
             let Some(&(b, tag)) = exits.get(&(edge.from, edge.to)) else { continue };
             dst.m.set_block(b);
-            let mut slot = 1;
             for &v in &edge.live {
-                let n = src.transport_words(v)?;
-                if n != 0 {
+                // The defining piece writes a distinct slot. Later pieces can bypass
+                // it or read it without copying it at their own outgoing edges.
+                if let Some(&slot) = slots.get(&v) {
+                    if !local.contains_key(&src.def_block[inst(v)?]) { continue; }
                     let words = src.pack(v, *values.get(&v)?, &mut dst.m);
                     for (k, word) in words.into_iter().enumerate() {
                         let at = scratch.at(&mut dst.m, slot + k as u32);
                         dst.raw_store(scratch.uav, at, &[word]);
                     }
-                    slot += n;
                 }
             }
             dst.raw_store(scratch.uav, scratch.base, &[tag]);
             dst.m.ret();
         }
+        src.place_restores(&mut dst, &scratch, slots, &deferred)?;
+        dst.m.sink_cheap_piece_ops();
         dst.infer_piece_features();
         // a refused piece leaves the whole program unsplit: say so
         let refused = |e: String| crate::xlog_warn!("compute split: piece {} of {} refused, the program stays whole: {}",
@@ -292,6 +267,17 @@ impl Shader {
     }
 }
 
+fn common_dominator(mut a: usize, mut b: usize, rank: &[Option<u32>], dom: &[Option<usize>]) -> usize {
+    while a != b {
+        if rank[a] > rank[b] {
+            a = dom[a].unwrap();
+        } else {
+            b = dom[b].unwrap();
+        }
+    }
+    a
+}
+
 fn inst(v: Value) -> Option<usize> {
     if let Value::Inst(i) = v { Some(i as usize) } else { None }
 }
@@ -305,6 +291,128 @@ impl Module {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    // Phi operands are consumed on incoming edges. A forwarding-only input has
+    // no placeholder users, so it requires no load in this piece.
+    fn place_restores(
+        &self,
+        dst: &mut Shader,
+        scratch: &Scratch,
+        slots: &BTreeMap<Value, u32>,
+        deferred: &BTreeMap<Value, Value>,
+    ) -> Option<()> {
+        let (order, rank) = dst.m.block_layout();
+        let dom = dst.m.idoms(&order.iter().map(|&b| b as u32).collect::<Vec<_>>());
+        let mut uses = HashMap::new();
+        for &b in &order {
+            for &id in &dst.m.blocks[b] {
+                let op = &dst.m.insts[id as usize].op;
+                let mut record = |v: Value, p: usize| {
+                    if deferred.contains_key(&v) {
+                        uses.entry(v).and_modify(|d| *d = common_dominator(*d, p, &rank, &dom)).or_insert(p);
+                    }
+                };
+                if let Op::Phi(edges) = op {
+                    for &(v, p) in edges {
+                        record(v, p.0 as usize);
+                    }
+                } else {
+                    op.for_each_operand(|v| record(v, b));
+                }
+            }
+        }
+        let mut replacements = HashMap::new();
+        for (&placeholder, &v) in deferred {
+            let Some(&b) = uses.get(&placeholder) else { continue };
+            dst.m.set_block(Block(b as u32));
+            let terminator = dst.m.blocks[b].pop()?;
+            let previous = dst.m.blocks[b].len();
+            let slot = slots[&v];
+            let words = (slot..slot + self.transport_words(v)?)
+                .map(|k| {
+                    let at = scratch.at(&mut dst.m, k);
+                    dst.raw_load(scratch.uav, at, 1)[0]
+                })
+                .collect::<Vec<_>>();
+            let value = self.unpack(v, &words, &mut dst.m);
+            let added = dst.m.blocks[b].split_off(previous);
+            // In block zero the scratch address is materialized before the switch.
+            // At every other block entry only the leading phis must precede a load.
+            let at = if b == 0 {
+                previous
+            } else {
+                dst.m.blocks[b].iter().take_while(|&&i| matches!(dst.m.insts[i as usize].op, Op::Phi(_))).count()
+            };
+            dst.m.blocks[b].splice(at..at, added);
+            dst.m.blocks[b].push(terminator);
+            replacements.insert(placeholder, value);
+        }
+        dst.m.replace_uses(&replacements);
+        Some(())
+    }
+
+    fn sink_cheap_piece_ops(&mut self) {
+        // Only sink a cheap definition whose nonconstant inputs are already used in
+        // the destination block. Moving it cannot introduce a new live-in there.
+        let (order, _) = self.block_layout();
+        let mut uses: HashMap<Value, BTreeSet<usize>> = HashMap::new();
+        for &b in &order {
+            for &id in &self.blocks[b] {
+                let op = &self.insts[id as usize].op;
+                if let Op::Phi(inc) = op {
+                    for &(v, p) in inc {
+                        uses.entry(v).or_default().insert(p.0 as usize);
+                    }
+                } else {
+                    op.for_each_operand(|v| {
+                        uses.entry(v).or_default().insert(b);
+                    });
+                }
+            }
+        }
+        // Moving a producer and then a consumer based on stale use sets may violate
+        // dominance. Limit this pass to candidates whose consumers stay in place.
+        let eligible = |op: &Op| matches!(op, Op::Cast(CastOp::BitCast | CastOp::Trunc, ..) | Op::Select(..));
+        let mut feeds_candidate = HashSet::new();
+        for def in &self.insts {
+            if eligible(&def.op) {
+                def.op.for_each_operand(|v| {
+                    feeds_candidate.insert(v);
+                });
+            }
+        }
+        for &b in &order {
+            for id in self.blocks[b].clone() {
+                let val = Value::Inst(id);
+                if !eligible(&self.insts[id as usize].op) || feeds_candidate.contains(&val) {
+                    continue;
+                }
+                let Some(sites) = uses.get(&val) else { continue };
+                if sites.len() != 1 {
+                    continue;
+                }
+                let t = *sites.first().unwrap();
+                if t == b {
+                    continue;
+                }
+                let mut shared = true;
+                self.insts[id as usize].op.for_each_operand(|v| {
+                    if let Value::Inst(_) = v {
+                        shared &= uses.get(&v).is_some_and(|vs| vs.contains(&t))
+                            && self.def_block[inst(v).unwrap()].0 as usize != t;
+                    }
+                });
+                if !shared {
+                    continue;
+                }
+                let at =
+                    self.blocks[t].iter().take_while(|&&i| matches!(self.insts[i as usize].op, Op::Phi(_))).count();
+                self.blocks[b].retain(|&i| i != id);
+                self.blocks[t].insert(at, id);
+                self.def_block[id as usize] = Block(t as u32);
+            }
         }
     }
 
