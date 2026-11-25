@@ -983,6 +983,45 @@ fn int64_bit_ops_match_cpu() {
     }
 }
 
+/// `Bfrev` of an i64 product that is the same on every lane. AMD's driver
+/// returned `x | bfrev(x)` for the low half (`Bfrev.i32(trunc(mul i64))`), which
+/// broke fuzz seed 817 (#2115).
+#[test]
+fn bfrev_i64_of_a_uniform_product_matches_cpu() {
+    let mut k = kernel();
+    let lo = k.input(0);
+    let i64 = k.s.m.i64();
+    let l64 = k.s.m.cast(CastOp::ZExt, lo, i64);
+    let zero = k.s.m.const_int(i64, 0);
+    let l64 = k.s.m.bin(BinOp::And, l64, zero);
+    let cases: [(u64, u64); 2] = [(3, 5), ((-7i64) as u64, 10604288470170369447)];
+    let mut outs = vec![];
+    for &(a, b) in &cases {
+        let ca = k.s.m.const_int(i64, a);
+        let a = k.s.m.bin(BinOp::Or, l64, ca);
+        let cb = k.s.m.const_int(i64, b);
+        let p = k.s.m.bin(BinOp::Mul, a, cb);
+        let rev = k.s.bfrev(p);
+        let i32 = k.s.m.i32();
+        outs.push(k.s.m.cast(CastOp::Trunc, rev, i32));
+        let c32 = k.s.m.const_int(i64, 32);
+        let hi = k.s.m.bin(BinOp::LShr, rev, c32);
+        outs.push(k.s.m.cast(CastOp::Trunc, hi, i32));
+    }
+    for (i, &o) in outs.iter().enumerate() {
+        k.out(i as u32, o);
+    }
+    let c = k.finish([32, 1, 1]);
+    let Some(r) = gpu(&c, &mem_of(&[UVALS.to_vec()]), &[], &[]) else { return };
+    for (n, &(a, b)) in cases.iter().enumerate() {
+        let want = a.wrapping_mul(b).reverse_bits();
+        for l in 0..32 {
+            assert_eq!(outv(&r, 2 * n)[l], want as u32, "case {n} low word");
+            assert_eq!(outv(&r, 2 * n + 1)[l], (want >> 32) as u32, "case {n} high word");
+        }
+    }
+}
+
 #[test]
 fn uav_array_3d_stores_loads_and_texture_atomics_run() {
     // u: heap 3 = RWTexture2DArray<uint> 4×4×2, heap 5 = RWTexture3D<float> 4×4×2.
