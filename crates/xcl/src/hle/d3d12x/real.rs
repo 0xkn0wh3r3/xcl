@@ -4699,9 +4699,13 @@ unsafe fn own_graphics(desc: *const c_void) -> Option<OwnedDesc> {
     Some(OwnedDesc::Graphics(d, blobs, elems, names))
 }
 
-/// A pipeline state stream with its shaders copied. None when another subobject points at
-/// title memory (input layout, stream output, view instancing).
+/// A pipeline state stream with its shaders copied. None when the stream is unreadable or
+/// truncated, a shader pointer is unreadable, or another subobject points at title memory
+/// (input layout, stream output, view instancing).
 unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
+    if !crate::gpu::shader::readable(desc as usize, 16) {
+        return None;
+    }
     let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
     if !crate::gpu::shader::readable(base, size) {
         return None;
@@ -4712,21 +4716,29 @@ unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
     while off + 8 <= size {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
         let (psize, palign) = super::null::subobject_payload(ty)?;
-        let at = off + if palign == 8 { 8 } else { 4 };
+        let at = off.checked_add(if palign == 8 { 8 } else { 4 })?;
+        let end = at.checked_add(psize)?;
+        if end > size {
+            return None;
+        }
         let word = |buf: &[u8], k: usize| u64::from_le_bytes(buf[at + 8 * k..at + 8 * k + 8].try_into().unwrap());
         match ty {
             1..=6 | 24 | 25 => {
                 let (p, n) = (word(&buf, 0) as usize, word(&buf, 1) as usize);
-                if p != 0 && n != 0 && crate::gpu::shader::readable(p, n) {
+                if p == 0 || n == 0 {
+                    buf[at..at + 16].fill(0);
+                } else if crate::gpu::shader::readable(p, n) {
                     blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
                     buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
+                } else {
+                    return None;
                 }
             }
-            7 | 12 | 22 if buf[at..at + psize].iter().any(|&b| b != 0) => return None,
+            7 | 12 | 22 if buf[at..end].iter().any(|&b| b != 0) => return None,
             19 => buf[at..at + 16].fill(0),
             _ => {}
         }
-        off += ((at - off) + psize + 7) & !7;
+        off = end.checked_add(7)? & !7;
     }
     let d = Box::new([buf.len(), buf.as_ptr() as usize]);
     Some(OwnedDesc::Stream(d, buf, blobs))
@@ -5062,10 +5074,11 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.is_some(), waited.elapsed().as_millis());
     }
     let hr = driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv));
-    if hr < 0 {
+    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
     }
+    let mesh_pso = *ppv;
     let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
@@ -5112,13 +5125,13 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     drop(_slot);
     if hc < 0 || compute.is_null() {
         note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
-        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
-        release(*ppv);
+        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(mesh_pso as *const *const usize)).add(2));
+        release(mesh_pso);
         *ppv = std::ptr::null_mut();
         return E_INVALIDARG;
     }
-    note_pso_rs(*ppv, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    note_pso_rs(mesh_pso, mesh_rs);
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
         crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
@@ -5520,6 +5533,26 @@ unsafe fn put<T>(to: &mut T, from: &[u8]) {
     std::ptr::copy_nonoverlapping(from.as_ptr(), to as *mut T as *mut u8, n);
 }
 
+/// True when a pipeline stream carries a shader subobject whose non-null, non-empty bytecode
+/// pointer is not readable (handing it to D3D12Core would access-violate instead of failing).
+unsafe fn stream_has_unreadable_shader(desc: *const c_void) -> bool {
+    if !crate::gpu::shader::readable(desc as usize, 16) {
+        return false;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    if !crate::gpu::shader::readable(base, size) {
+        return false;
+    }
+    let buf = std::slice::from_raw_parts(base as *const u8, size);
+    known_subobjects(buf).into_iter().any(|(ty, p)| {
+        matches!(ty, 1..=6 | 24 | 25) && p.len() >= 16 && {
+            let ptr = u64::from_le_bytes(p[0..8].try_into().unwrap()) as usize;
+            let len = u64::from_le_bytes(p[8..16].try_into().unwrap()) as usize;
+            ptr != 0 && len != 0 && !crate::gpu::shader::readable(ptr, len)
+        }
+    })
+}
+
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
@@ -5538,6 +5571,9 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
         StreamPipeline::Graphics(d) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true),
         StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
         StreamPipeline::Unknown => {}
+    }
+    if stream_has_unreadable_shader(desc) {
+        return E_INVALIDARG;
     }
     let hr = finish_pso(this, f, desc, riid, ppv);
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, 16) {
@@ -6861,6 +6897,158 @@ mod map_tests {
                 m.remove(&(raw as usize));
                 m.remove(&(upload.as_raw() as usize));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mesh_stream_tests {
+    use super::*;
+
+    #[test]
+    fn own_stream_rejects_null_truncated_and_unreadable_streams() {
+        unsafe {
+            // null desc pointer and empty / null stream buffer
+            assert!(own_stream(std::ptr::null()).is_none());
+            let empty_desc: [usize; 2] = [0, 0];
+            assert!(own_stream(empty_desc.as_ptr() as *const c_void).is_none());
+
+            // truncated shader subobject (MS = 25, align 8, payload 16 B -> needs 24 B, only 16 B given)
+            let mut trunc_ms = [0u8; 16];
+            trunc_ms[0..4].copy_from_slice(&25u32.to_le_bytes());
+            let d_trunc_ms: [usize; 2] = [trunc_ms.len(), trunc_ms.as_ptr() as usize];
+            assert!(own_stream(d_trunc_ms.as_ptr() as *const c_void).is_none());
+
+            // truncated INPUT_LAYOUT (12, align 8, payload 16 B -> only 12 B given)
+            let mut trunc_il = [0u8; 12];
+            trunc_il[0..4].copy_from_slice(&12u32.to_le_bytes());
+            let d_trunc_il: [usize; 2] = [trunc_il.len(), trunc_il.as_ptr() as usize];
+            assert!(own_stream(d_trunc_il.as_ptr() as *const c_void).is_none());
+
+            // truncated CACHED_PSO (19, align 8, payload 16 B -> only 16 B given)
+            let mut trunc_cache = [0u8; 16];
+            trunc_cache[0..4].copy_from_slice(&19u32.to_le_bytes());
+            let d_trunc_cache: [usize; 2] = [trunc_cache.len(), trunc_cache.as_ptr() as usize];
+            assert!(own_stream(d_trunc_cache.as_ptr() as *const c_void).is_none());
+
+            // unreadable shader pointer in MS subobject (must not leak raw pointer into background worker)
+            let mut bad_ptr = [0u8; 24];
+            bad_ptr[0..4].copy_from_slice(&25u32.to_le_bytes());
+            bad_ptr[8..16].copy_from_slice(&0x1000u64.to_le_bytes());
+            bad_ptr[16..24].copy_from_slice(&64u64.to_le_bytes());
+            let d_bad: [usize; 2] = [bad_ptr.len(), bad_ptr.as_ptr() as usize];
+            assert!(own_stream(d_bad.as_ptr() as *const c_void).is_none());
+
+            // valid stream: readable MS blob copied, zero-len stale PS pointer zeroed, CACHED_PSO zeroed
+            let shader = vec![0x44u8, 0x58, 0x42, 0x43, 1, 2, 3, 4];
+            let mut valid = [0u8; 72];
+            // [0..24]: MS (25) with readable shader
+            valid[0..4].copy_from_slice(&25u32.to_le_bytes());
+            valid[8..16].copy_from_slice(&(shader.as_ptr() as u64).to_le_bytes());
+            valid[16..24].copy_from_slice(&(shader.len() as u64).to_le_bytes());
+            // [24..48]: PS (2) with non-null pointer and length 0
+            valid[24..28].copy_from_slice(&2u32.to_le_bytes());
+            valid[32..40].copy_from_slice(&0xDEAD_BEEFu64.to_le_bytes());
+            valid[40..48].copy_from_slice(&0u64.to_le_bytes());
+            // [48..72]: CACHED_PSO (19) with non-zero bytes
+            valid[48..52].copy_from_slice(&19u32.to_le_bytes());
+            valid[56..72].fill(0xAA);
+
+            let d_valid: [usize; 2] = [valid.len(), valid.as_ptr() as usize];
+            let owned = own_stream(d_valid.as_ptr() as *const c_void).expect("valid stream");
+            let OwnedDesc::Stream(_, buf, blobs) = owned else { panic!("expected Stream") };
+            assert_eq!(blobs.len(), 1);
+            assert_eq!(blobs[0], shader);
+            let rebased = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
+            assert_eq!(rebased, blobs[0].as_ptr() as usize);
+            assert_ne!(rebased, shader.as_ptr() as usize);
+            assert_eq!(&buf[32..48], &[0u8; 16], "zero-len shader entry cleared");
+            assert_eq!(&buf[56..72], &[0u8; 16], "cached PSO cleared");
+        }
+    }
+
+    unsafe extern "system" fn fake_create_pso_null_ok(
+        _: *mut c_void,
+        _: *const c_void,
+        _: *const GUID,
+        ppv: *mut *mut c_void,
+    ) -> HRESULT {
+        if !ppv.is_null() {
+            *ppv = std::ptr::null_mut();
+        }
+        S_OK
+    }
+
+    unsafe extern "system" fn fake_create_compute_unexpected(
+        _: *mut c_void,
+        _: *const c_void,
+        _: *const GUID,
+        _: *mut *mut c_void,
+    ) -> HRESULT {
+        panic!("CreateComputePipelineState must not be called when mesh PSO out-pointer is null");
+    }
+
+    #[test]
+    fn finish_two_pass_rejects_null_mesh_out_pointer() {
+        let iface = layout::find("ID3D12Device2").expect("ID3D12Device2 layout");
+        let pso_slot = layout::slot(iface, "CreatePipelineState").expect("CreatePipelineState slot");
+        let cs_slot = layout::slot(iface, "CreateComputePipelineState").expect("CreateComputePipelineState slot");
+        let mut pc = vec![0usize; iface.methods.len()];
+        pc[pso_slot] = fake_create_pso_null_ok as usize;
+        pc[cs_slot] = fake_create_compute_unexpected as usize;
+
+        let ext_buf = [pc.as_ptr() as usize, 0];
+        let ext_vtbl = ext_buf.as_ptr() as usize + std::mem::size_of::<usize>();
+        let mut fake_dev = [ext_vtbl];
+        let this = fake_dev.as_mut_ptr() as *mut c_void;
+
+        // Unique synthetic sampler key so we never touch global ABI_RS or real sampler caches.
+        let sampler: crate::gpu::recomp::pso::StaticSampler = ([0x55AA_1968, 0xCAFE_1968, 0xBEEF_1968, 0x0001_1968], true);
+        let key: Vec<u32> = sampler.0.iter().copied().chain([1u32]).collect();
+
+        struct Cleanup {
+            ext: usize,
+            key: Vec<u32>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                CLASSES.lock().unwrap().retain(|c| c.ext != self.ext);
+                if let Some(m) = ABI_RS_SAMPLERS.lock().unwrap().as_mut() {
+                    m.remove(&self.key);
+                }
+            }
+        }
+        CLASSES.lock().unwrap().push(Class {
+            orig: pc.as_ptr() as usize,
+            kind: Kind::Device,
+            ext: ext_vtbl,
+            iface,
+            public: iface.methods.len(),
+            scanned: iface.methods.len(),
+        });
+        ABI_RS_SAMPLERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(key.clone(), 0x1234_5678);
+        let _cleanup = Cleanup { ext: ext_vtbl, key };
+
+        let make_tp = || crate::gpu::recomp::pso::TwoPass {
+            cs: vec![0; 16],
+            ms: vec![0; 16],
+            record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1 },
+            mesh_groups_per_record: 1,
+            samplers: vec![sampler],
+        };
+        let stream = StreamOut::default();
+        let iid = pc_iid(Kind::PipelineState);
+
+        unsafe {
+            // Case 1: driver returns S_OK but leaves *ppv == null
+            let mut out: *mut c_void = std::ptr::null_mut();
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &iid, &mut out);
+            assert_eq!(hr, E_INVALIDARG);
+            assert!(out.is_null());
+
+            // Case 2: caller passes ppv == null
+            let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, "MS", &iid, std::ptr::null_mut());
+            assert_eq!(hr, E_INVALIDARG);
         }
     }
 }
