@@ -155,6 +155,16 @@ fn run_shaders(target: &Path, extra: &[&str]) -> Output {
 }
 
 #[test]
+fn help_lists_shader_precompile_options() {
+    let out = Command::new(env!("CARGO_BIN_EXE_xcl")).arg("--help").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let help = String::from_utf8(out.stdout).unwrap();
+    for flag in ["--precompile", "--only", "--pipelines", "--used-only"] {
+        assert!(help.contains(flag), "missing {flag} in xcl --help");
+    }
+}
+
+#[test]
 fn shaders_single_file_reports_text_top_json_recomp_and_dxc_compile() {
     let dir = TempDir::new("single");
     let file = dir.path().join("ps.bin");
