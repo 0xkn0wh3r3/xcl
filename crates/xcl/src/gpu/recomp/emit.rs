@@ -5752,9 +5752,11 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
         return uint4(id[0], id[1], id[2], id[3]);
     }
     if (type <= 3u) {
-        // GPURT gfx10 node: a pair of triangles, type 0 = (v0, v1, v2), type 1 = (v1, v3, v2)
-        bool t1 = type == 1u;
-        float3 v0 = asfloat(mem.Load3(at + (t1 ? 12u : 0u))), v1 = asfloat(mem.Load3(at + (t1 ? 36u : 12u))), v2 = asfloat(mem.Load3(at + 24u));
+        // GPURT gfx10 node: up to four triangles across 5 vertices: 0=(0,1,2), 1=(1,3,2), 2=(2,3,4), 3=(2,4,0)
+        uint o0 = type == 0u ? 0u : (type == 1u ? 12u : 24u);
+        uint o1 = type == 0u ? 12u : (type == 3u ? 48u : 36u);
+        uint o2 = type <= 1u ? 24u : (type == 2u ? 48u : 0u);
+        float3 v0 = asfloat(mem.Load3(at + o0)), v1 = asfloat(mem.Load3(at + o1)), v2 = asfloat(mem.Load3(at + o2));
         float3 e1 = v1 - v0, e2 = v2 - v0, p = cross(d, e2);
         float det = dot(e1, p);
         float3 sv = o - v0, q = cross(sv, e1);
