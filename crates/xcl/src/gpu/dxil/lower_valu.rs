@@ -351,6 +351,9 @@ impl Lw {
         if name.starts_with("v_pk_") || name.starts_with("v_dot") {
             return self.valu_pk(d, name);
         }
+        if matches!(name, "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" | "v_mqsad_u32_u8") {
+            return self.valu_qsad(d, name);
+        }
         if name.starts_with("v_movrel") {
             return self.movrel(d, name);
         }
