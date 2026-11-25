@@ -445,6 +445,7 @@ impl Lw {
             whole_live: Default::default(),
             guard_override: None,
             mask_override: None,
+            local_masks: false,
             exchange_error: None,
             pc: 0,
         };
