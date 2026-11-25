@@ -188,6 +188,7 @@ fn translate_on_this_thread(
         None => Cfg::build(code)?,
     };
     let kernel = matches!(entry, Entry::Kernel);
+    let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let compute = matches!(entry, Entry::Compute(_));
     let split = o.wave64 && o.split && !gfx;
@@ -311,6 +312,9 @@ fn translate_on_this_thread(
         lw.edge(Block(0), h0);
     }
     let switch = if two_phase { Some(lw.block(None)) } else { None };
+    // scalar loads the program repeats keep their first values (compute programs and kernels:
+    // the other stages enter their code by edges the CFG does not hold)
+    let reloads = if follow_loads { super::reload::analyze(&cfg) } else { Default::default() };
     let mut gs_entry: Option<usize> = None;
     if let Some(p) = &plan {
         match nest {
@@ -344,8 +348,10 @@ fn translate_on_this_thread(
             lw.wr(VAR_BUDGET, l);
         }
         for &i in &cfg.blocks[b].insts {
+            lw.reload = reloads.get(b, i);
             lw.inst(&cfg.insts[i])?;
         }
+        lw.reload = None;
         match cfg.blocks[b].term {
             Term::Jump(t) if es_block && in_gs(t) => {
                 // the ES's s_setpc_b64 into the GS: through the phase switch
@@ -492,6 +498,7 @@ impl Lw {
             fmt_table: None,
             fmt_desc_cache: HashMap::new(),
             fmt_comp1_cache: HashMap::new(),
+            reload: None,
             uma_base_val: None,
             ntmp: 0,
             scratch: None,
