@@ -477,9 +477,8 @@ pub fn init() -> Result<String, String> {
         }
         let debug = cfg.d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some();
         if debug {
-            match crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
-                Ok(d) => {
-                    d.EnableDebugLayer();
+            match crate::gpu::agility::enable_debug_layer() {
+                Ok(()) => {
                     crate::xlog_info!("D3D12: debug layer enabled");
                 }
                 Err(e) => {
