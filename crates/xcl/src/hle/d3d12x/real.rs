@@ -5412,6 +5412,8 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    // a big compute program that writes nothing but images: binds can go on without it
+    let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
     let job: super::pso_async::Job = Box::new(move || {
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
@@ -5424,6 +5426,9 @@ unsafe fn go_background(
         super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
     } else {
         super::pso_async::submit(*ppv as usize, compute, job);
+    }
+    if image_only {
+        super::pso_async::image_only(*ppv as usize);
     }
     Some(hr)
 }
