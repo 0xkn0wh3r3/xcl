@@ -892,7 +892,8 @@ impl Lw {
                     let tex = lw.s.heap_texture(ui, lkind, true, ct, 1, true);
                     let old = match aop {
                         Some(o) => lw.s.atomic_binop(tex.handle, o, &ic2, v),
-                        None if opn == "cmpswap" || opn == "fcmpswap" => lw.s.atomic_cmpxchg(tex.handle, &ic2, cmpv, v),
+                        None if opn == "cmpswap" => lw.s.atomic_cmpxchg(tex.handle, &ic2, cmpv, v),
+                        None if opn == "fcmpswap" => lw.texel_fcas(tex.handle, &ic2, cmpv, v),
                         None => lw.texel_cas(tex.handle, &ic2, &opn, v),
                     };
                     lw.wr(tmp, old);
@@ -1025,6 +1026,42 @@ impl Lw {
         self.cond_br(stop, ex, lp);
         self.s.m.set_block(ex);
         p
+    }
+
+    /// IEEE-754 float compare-exchange loop on a texel (`image_atomic_fcmpswap`).
+    fn texel_fcas(&mut self, h: Value, ic: &[Value], cmp: Value, v: Value) -> Value {
+        // the initial value: an atomic or 0 reads it without changing it
+        let z = self.c(0);
+        let init = self.s.atomic_binop(h, AtomicOp::Or, ic, z);
+        let pre = self.cur();
+        let lp = self.block(Some(2));
+        let try_cas = self.block(Some(1));
+        let ex = self.block(Some(2));
+        self.br(lp);
+        self.s.m.set_block(lp);
+        let i32 = self.s.m.i32();
+        let c = self.s.m.phi(i32);
+        let i = self.s.m.phi(i32);
+        self.s.m.add_incoming(c, init, pre);
+        self.s.m.add_incoming(i, z, pre);
+        let eq = self.feq_bits32(c, cmp);
+        let lp_end = self.cur();
+        self.cond_br(eq, try_cas, ex);
+        self.s.m.set_block(try_cas);
+        let p = self.s.atomic_cmpxchg(h, ic, c, v);
+        let ok = self.cmp(Pred::Eq, p, c);
+        let i1 = self.addc(i, 1);
+        let out = self.cmpc(Pred::UGe, i1, 4096);
+        let stop = self.lor(ok, out);
+        let me = self.cur();
+        self.s.m.add_incoming(c, p, me);
+        self.s.m.add_incoming(i, i1, me);
+        self.cond_br(stop, ex, lp);
+        self.s.m.set_block(ex);
+        let res = self.s.m.phi(i32);
+        self.s.m.add_incoming(res, c, lp_end);
+        self.s.m.add_incoming(res, p, me);
+        res
     }
 
     /// `img_cls`: 1 uint, 2 sint, 0 float (by the buffer-format table's numeric type).

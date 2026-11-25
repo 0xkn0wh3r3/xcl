@@ -409,11 +409,11 @@ fn atomic_inc_dec_x2_encoding_families() {
     }
 }
 
-/// *_atomic_fcmpswap_x2 (buffer / flat / global): a 64-bit float compare-swap; the payload
-/// compares bitwise, exactly like the 32-bit fcmpswap – one InterlockedCompareExchange64.
-/// Deterministic emitted text on all three encoding families.
+/// *_atomic_fcmpswap_x2 (buffer / flat / global): 64-bit IEEE-754 float compare-swap in a
+/// bounded u64 CAS loop (`-0.0 == +0.0`, `NaN != NaN`, no `DoubleExtensions` required).
+/// Deterministic emitted text on all three encoding families, plus multi-window & direct DXIL.
 #[test]
-fn atomic_fcmpswap_x2_is_a_bitwise_64_bit_cas() {
+fn atomic_fcmpswap_x2_uses_ieee_64_bit_cas() {
     let code = prog(&[
         ("BUFFER_ATOMIC_FCMPSWAP_X2", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 8), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)], None),
         ("FLAT_ATOMIC_FCMPSWAP_X2", "ENC_FLAT", &[("VDST", 12), ("ADDR", 14), ("DATA", 16), ("GLC", 1)], None),
@@ -421,8 +421,13 @@ fn atomic_fcmpswap_x2_is_a_bitwise_64_bit_cas() {
     ]);
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
-    // one native 64-bit CAS per instruction – no emulation loop
+    // bounded IEEE-754 float CAS loop using atomic Or-0 initial load, pure u64 bitwise checks,
+    // and InterlockedCompareExchange64 (no tearing 64-bit Load2 on mismatch early-exit)
+    assert!(!t.hlsl.contains("mem.Load2("), "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("mem.InterlockedOr64(").count(), 3, "{}", t.hlsl);
     assert_eq!(t.hlsl.matches("mem.InterlockedCompareExchange64(").count(), 3, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("0x7FF0000000000000ull").count(), 3, "{}", t.hlsl);
+    assert_eq!(t.hlsl.matches("0x7FFFFFFFFFFFFFFFull").count(), 6, "{}", t.hlsl);
     // [DATA:DATA+1] is the swap value, [DATA+2:DATA+3] the compare value (128-bit operand)
     assert!(t.hlsl.contains("_v = (uint64_t)v4 | ((uint64_t)v5 << 32); uint64_t") && t.hlsl.contains("_cmp = (uint64_t)v6 | ((uint64_t)v7 << 32);"), "{}", t.hlsl);
     assert!(t.hlsl.contains("_cmp = (uint64_t)v18 | ((uint64_t)v19 << 32);"), "{}", t.hlsl);
@@ -436,8 +441,17 @@ fn atomic_fcmpswap_x2_is_a_bitwise_64_bit_cas() {
     assert!(t.hlsl.contains("v4 = (uint)t") && t.hlsl.contains("v5 = (uint)(t"), "{}", t.hlsl);
     assert!(t.hlsl.contains("v12 = (uint)t") && t.hlsl.contains("v13 = (uint)(t"), "{}", t.hlsl);
     assert!(t.hlsl.contains("v20 = (uint)t") && t.hlsl.contains("v21 = (uint)(t"), "{}", t.hlsl);
+    let w = translate(&code, &Options { mem_windows: 2, ..Default::default() }).unwrap();
+    assert!(!w.hlsl.contains("xcl_mLoad2(t"), "{}", w.hlsl);
+    assert_eq!(w.hlsl.matches("xcl_mInterlockedOr64(t").count(), 3, "{}", w.hlsl);
+    assert_eq!(w.hlsl.matches("xcl_mInterlockedCompareExchange64(t").count(), 3, "{}", w.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        super::dxc::compile(&w.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", w.hlsl));
+        for mem_windows in [1, 2, 2 | super::HEAP_WINDOWS] {
+            let o = crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: true, mem_windows, sampler_base: 0 };
+            crate::gpu::dxil::kernel::translate_full(&code, o).unwrap_or_else(|e| panic!("dxil windows={mem_windows:#x}: {e}"));
+        }
     }
 }
 
@@ -5238,9 +5252,10 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
     assert_eq!(r.sgpr[106] | r.sgpr[107], 0, "v_div_scale_f32: VCC 0 (no post-scale)");
 }
 
-/// *_atomic_fcmpswap_x2 on hardware: a bitwise 64-bit compare-swap. A compare value equal
-/// as a float but different in bits (-0.0 vs +0.0) must NOT swap; GLC returns the old qword.
-/// Per-lane cells are deterministic; the three shared cells end in the unique winner's value.
+/// *_atomic_fcmpswap_x2 on hardware: IEEE-754 64-bit float compare-swap (XCL-BT-042).
+/// `-0.0 == +0.0` swaps (returning the pre-swap zero's sign bits), `NaN == NaN` keeps, and GLC
+/// returns the old qword. Per-lane cells are deterministic; the three shared cells end in the
+/// unique winner's value.
 #[test]
 fn gpu_atomic_fcmpswap_x2() {
     if !gpu_ready() {
@@ -5267,7 +5282,15 @@ fn gpu_atomic_fcmpswap_x2() {
     st.sgpr[8..12].copy_from_slice(&[0x600, 0, 0x200, 0]); // V#: base, stride/flags, records, –
     st.sgpr[12..16].copy_from_slice(&[0xC00, 0, 0x200, 0]);
     const INIT: u64 = 0x3FF8_0000_0000_0000; // f64 bits of 1.5
-    const NEG_ZERO: u64 = 0x8000_0000_0000_0000; // -0.0: == +0.0 numerically, different bits
+    const NEG_ZERO: u64 = 0x8000_0000_0000_0000; // -0.0
+    const QNAN: u64 = 0x7FF8_0000_0000_0000; // qNaN
+    // (initial cell, cmp, swaps)
+    let lane_case = |l: usize| match l % 4 {
+        0 => (INIT, INIT, true),
+        1 => (0u64, NEG_ZERO, true),
+        2 => (NEG_ZERO, 0u64, true),
+        _ => (QNAN, QNAN, false),
+    };
     let newv = |tag: u64, l: u64| tag << 48 | l;
     for (l, r) in st.vgpr.iter_mut().enumerate() {
         let l64 = l as u64;
@@ -5275,9 +5298,7 @@ fn gpu_atomic_fcmpswap_x2() {
         r[14] = 0x800 + 8 * l as u32;
         r[22] = 8 * l as u32; // + s2 -> 0xA00 + 8·lane
         r[10] = 0xE00; // flat shared cell (all lanes)
-        // even lanes: cell = INIT, cmp = INIT -> swap happens; odd lanes: cell = +0.0, cmp =
-        // -0.0 -> bitwise different -> no swap (a numeric compare would swap)
-        let cmp = if l % 2 == 0 { INIT } else { NEG_ZERO };
+        let (_, cmp, _) = lane_case(l);
         let put = |r: &mut Vec<u32>, at: usize, v: u64| {
             r[at] = v as u32;
             r[at + 1] = (v >> 32) as u32;
@@ -5297,7 +5318,7 @@ fn gpu_atomic_fcmpswap_x2() {
     }
     let mut mem = vec![0u32; 0x1400 / 4];
     for l in 0..64usize {
-        let b = if l % 2 == 0 { INIT } else { 0 };
+        let (b, _, _) = lane_case(l);
         for a in [0x600 + 8 * l, 0x800 + 8 * l, 0xA00 + 8 * l] {
             mem[a / 4] = b as u32;
             mem[a / 4 + 1] = (b >> 32) as u32;
@@ -5312,26 +5333,162 @@ fn gpu_atomic_fcmpswap_x2() {
     let cell = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
     for l in 0..64usize {
         let v = &r.vgpr[l];
-        let even = l % 2 == 0;
         let l64 = l as u64;
-        // per-lane cells: swapped iff cmp == cell bits
-        let (bs, fs, gs) = if even { (newv(0xB000, l64), newv(0xF000, l64), newv(0xA000, l64)) } else { (0, 0, 0) };
-        let cmp_old = if even { INIT } else { 0 }; // the cell's pre-swap value
+        let (init_cell, cmp, swaps) = lane_case(l);
+        let (bs, fs, gs) = if swaps { (newv(0xB000, l64), newv(0xF000, l64), newv(0xA000, l64)) } else { (init_cell, init_cell, init_cell) };
         assert_eq!(cell(0x600 + 8 * l), bs, "lane {l}: buffer cell");
         assert_eq!(cell(0x800 + 8 * l), fs, "lane {l}: flat cell");
         assert_eq!(cell(0xA00 + 8 * l), gs, "lane {l}: global cell");
         // GLC old value: VDATA in place for buffer, VDST for flat / global
-        assert_eq!(old(v, 4), cmp_old, "lane {l}: buffer GLC old");
-        assert_eq!(old(v, 12), cmp_old, "lane {l}: flat GLC old");
-        assert_eq!(old(v, 20), cmp_old, "lane {l}: global GLC old");
+        assert_eq!(old(v, 4), init_cell, "lane {l}: buffer GLC old");
+        assert_eq!(old(v, 12), init_cell, "lane {l}: flat GLC old");
+        assert_eq!(old(v, 20), init_cell, "lane {l}: global GLC old");
         // the compare register half is untouched
-        assert_eq!(old(v, 6), if even { INIT } else { NEG_ZERO }, "lane {l}: buffer cmp regs");
+        assert_eq!(old(v, 6), cmp, "lane {l}: buffer cmp regs");
     }
     // shared cells: exactly one lane sees INIT (the winner); the cell holds its value
     for (i, (dst, a, tag)) in [(30, 0xC00usize, 0x5B00u64), (40, 0xE00, 0x5F00), (44, 0x1200, 0x5A00)].iter().enumerate() {
         let winners: Vec<usize> = r.vgpr.iter().enumerate().filter(|(_, v)| old(v, *dst) == INIT).map(|(l, _)| l).collect();
         assert_eq!(winners.len(), 1, "shared cell {i}: exactly one lane wins the swap");
         assert_eq!(cell(*a), newv(*tag, winners[0] as u64), "shared cell {i}: the winner's value landed");
+    }
+}
+
+/// Float compare-and-swap atomics across LDS (`ds_cmpst_rtn_f32`), buffer/global/flat 32-bit and
+/// 64-bit (`*_atomic_fcmpswap`, `*_atomic_fcmpswap_x2`), and image UAV (`image_atomic_fcmpswap`)
+/// use IEEE-754 float equality (`-0.0 == +0.0` swaps, `qNaN == qNaN` and `sNaN == sNaN` keep,
+/// denormal != `+0.0`), while integer `cmpswap` / `ds_cmpst_rtn_b32` controls remain bitwise.
+/// Verified on the GPU through both HLSL and Direct DXIL (`XCL-BT-042`).
+#[test]
+fn gpu_float_cas_uses_ieee_equality() {
+    if !gpu_ready() {
+        return;
+    }
+    use runner::{TestTexture, TexDim};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+    let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    // Initialize LDS float and int-control cells with init32 (v10)
+    code.extend(enc("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 10)]));
+    code.extend(enc("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 10)]));
+    // 1) LDS: DS_CMPST_RTN_F32 (DATA0=cmp v11, DATA1=new v12) + bitwise DS_CMPST_RTN_B32 control
+    code.extend(enc("DS_CMPST_RTN_F32", "ENC_DS", &[("VDST", 22), ("ADDR", 0), ("DATA0", 11), ("DATA1", 12)]));
+    code.extend(enc("DS_READ_B32", "ENC_DS", &[("VDST", 23), ("ADDR", 0)]));
+    code.extend(enc("DS_CMPST_RTN_B32", "ENC_DS", &[("VDST", 24), ("ADDR", 1), ("DATA0", 11), ("DATA1", 12)]));
+    code.extend(enc("DS_READ_B32", "ENC_DS", &[("VDST", 25), ("ADDR", 1)]));
+    // 2) 32-bit buffer / global / flat float CAS + global bitwise control
+    code.extend(enc("BUFFER_ATOMIC_FCMPSWAP", "ENC_MUBUF", &[("VDATA", 14), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)]));
+    code.extend(enc("GLOBAL_ATOMIC_FCMPSWAP", "ENC_FLAT_GLBL", &[("VDST", 26), ("ADDR", 0), ("DATA", 16), ("SADDR", 4), ("GLC", 1)]));
+    code.extend(enc("FLAT_ATOMIC_FCMPSWAP", "ENC_FLAT", &[("VDST", 27), ("ADDR", 2), ("DATA", 16), ("GLC", 1)]));
+    code.extend(enc("GLOBAL_ATOMIC_CMPSWAP", "ENC_FLAT_GLBL", &[("VDST", 28), ("ADDR", 0), ("DATA", 16), ("SADDR", 6), ("GLC", 1)]));
+    // 3) 32-bit image UAV float CAS + bitwise control (64x1 R32_UINT UAVs)
+    code.extend(enc("IMAGE_ATOMIC_FCMPSWAP", "ENC_MIMG", &[("VDATA", 18), ("VADDR", 8), ("SRSRC", 6), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    code.extend(enc("IMAGE_ATOMIC_CMPSWAP", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 8), ("SRSRC", 8), ("DMASK", 0x3), ("DIM", 1), ("UNORM", 1), ("GLC", 1)]));
+    // 4) 64-bit buffer / global / flat float CAS + global bitwise control
+    code.extend(enc("BUFFER_ATOMIC_FCMPSWAP_X2", "ENC_MUBUF", &[("VDATA", 30), ("VADDR", 4), ("SRSRC", 3), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)]));
+    code.extend(enc("GLOBAL_ATOMIC_FCMPSWAP_X2", "ENC_FLAT_GLBL", &[("VDST", 40), ("ADDR", 4), ("DATA", 34), ("SADDR", 16), ("GLC", 1)]));
+    code.extend(enc("FLAT_ATOMIC_FCMPSWAP_X2", "ENC_FLAT", &[("VDST", 42), ("ADDR", 6), ("DATA", 34), ("GLC", 1)]));
+    code.extend(enc("GLOBAL_ATOMIC_CMPSWAP_X2", "ENC_FLAT_GLBL", &[("VDST", 44), ("ADDR", 4), ("DATA", 34), ("SADDR", 18), ("GLC", 1)]));
+    code.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    // 8 IEEE-754 edge cases: (init32, cmp32, init64, cmp64, float_swaps, int_swaps)
+    const CASES: [(u32, u32, u64, u64, bool, bool); 8] = [
+        (0x8000_0000, 0x0000_0000, 0x8000_0000_0000_0000, 0x0000_0000_0000_0000, true, false),  // -0.0 vs +0.0
+        (0x0000_0000, 0x8000_0000, 0x0000_0000_0000_0000, 0x8000_0000_0000_0000, true, false),  // +0.0 vs -0.0
+        (0x7FC0_0000, 0x7FC0_0000, 0x7FF8_0000_0000_0000, 0x7FF8_0000_0000_0000, false, true),  // qNaN vs qNaN
+        (0x7F80_0001, 0x7F80_0001, 0x7FF0_0000_0000_0001, 0x7FF0_0000_0000_0001, false, true),  // sNaN vs sNaN
+        (0x0000_0001, 0x0000_0000, 0x0000_0000_0000_0001, 0x0000_0000_0000_0000, false, false), // denorm vs +0.0
+        (0x3FC0_0000, 0x3FC0_0000, 0x3FF8_0000_0000_0000, 0x3FF8_0000_0000_0000, true, true),   // 1.5 vs 1.5
+        (0x3FC0_0000, 0x4020_0000, 0x3FF8_0000_0000_0000, 0x4004_0000_0000_0000, false, false), // 1.5 vs 2.5
+        (0xFF80_0000, 0xFF80_0000, 0xFFF0_0000_0000_0000, 0xFFF0_0000_0000_0000, true, true),   // -inf vs -inf
+    ];
+    const NEW32: u32 = 0x3F80_0000; // 1.0f
+    const NEW64: u64 = 0x3FF0_0000_0000_0000; // 1.0
+
+    let mut st = KernelState::default();
+    st.sgpr[4] = 0x0400;
+    st.sgpr[6] = 0x0600;
+    st.sgpr[8..12].copy_from_slice(&[0x0200, 0, 0x100, 0]);
+    st.sgpr[12..16].copy_from_slice(&[0x0A00, 0, 0x200, 0]);
+    st.sgpr[16] = 0x0C00;
+    st.sgpr[18] = 0x1000;
+    st.sgpr[24..32].copy_from_slice(&tsharp(0, 20, 9));
+    st.sgpr[32..40].copy_from_slice(&tsharp(2, 20, 9));
+
+    let mut mem = vec![0u32; 0x1400 / 4];
+    let mut tex_init = Vec::with_capacity(64 * 4);
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (init32, cmp32, init64, cmp64, _, _) = CASES[l % CASES.len()];
+        let off32 = 4 * l as u32;
+        let off64 = 8 * l as u32;
+        r[0] = off32;
+        r[1] = 0x100 + off32;
+        r[2] = 0x0500 + off32;
+        r[4] = off64;
+        r[6] = 0x0E00 + off64;
+        r[8] = l as u32;
+        r[9] = 0;
+        r[10] = init32;
+        r[11] = cmp32;
+        r[12] = NEW32;
+        for base_v in [14, 16, 18, 20] {
+            r[base_v] = NEW32;
+            r[base_v + 1] = cmp32;
+        }
+        for base_v in [30, 34] {
+            r[base_v] = NEW64 as u32;
+            r[base_v + 1] = (NEW64 >> 32) as u32;
+            r[base_v + 2] = cmp64 as u32;
+            r[base_v + 3] = (cmp64 >> 32) as u32;
+        }
+        for a in [0x0200 + 4 * l, 0x0400 + 4 * l, 0x0500 + 4 * l, 0x0600 + 4 * l] {
+            mem[a / 4] = init32;
+        }
+        for a in [0x0A00 + 8 * l, 0x0C00 + 8 * l, 0x0E00 + 8 * l, 0x1000 + 8 * l] {
+            mem[a / 4] = init64 as u32;
+            mem[a / 4 + 1] = (init64 >> 32) as u32;
+        }
+        tex_init.extend_from_slice(&init32.to_le_bytes());
+    }
+    let tex = vec![
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 64, height: 1, depth: 1, texel_bytes: 4, data: tex_init.clone(), uav: true },
+        TestTexture { dim: TexDim::D2, format: DXGI_FORMAT_R32_UINT, width: 64, height: 1, depth: 1, texel_bytes: 4, data: tex_init, uav: true },
+    ];
+
+    let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported);
+    let hlsl_dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|x| format!("{x}\n--- HLSL ---\n{}", t.hlsl)).unwrap();
+    let direct_dxil = runner::direct_kernel_full(&code, true).unwrap().dxil;
+
+    for (backend, dxil) in [("hlsl", hlsl_dxil), ("direct_dxil", direct_dxil)] {
+        let r = runner::run_with_statics(&dxil, &st, &mem, &tex, &[], &[]).unwrap_or_else(|e| panic!("{backend}: {e}"));
+        let old64 = |v: &[u32], at: usize| v[at] as u64 | (v[at + 1] as u64) << 32;
+        let cell64 = |a: usize| r.mem[a / 4] as u64 | (r.mem[a / 4 + 1] as u64) << 32;
+        let tex32 = |ti: usize, l: usize| u32::from_le_bytes(r.textures[ti][4 * l..4 * l + 4].try_into().unwrap());
+        for l in 0..64usize {
+            let (init32, _, init64, _, fswap, iswap) = CASES[l % CASES.len()];
+            let want_f32 = if fswap { NEW32 } else { init32 };
+            let want_i32 = if iswap { NEW32 } else { init32 };
+            let want_f64 = if fswap { NEW64 } else { init64 };
+            let want_i64 = if iswap { NEW64 } else { init64 };
+            let v = &r.vgpr[l];
+            // 1) LDS
+            assert_eq!((v[22], v[23]), (init32, want_f32), "{backend} lane {l} case {}: ds_cmpst_rtn_f32 (old, cell)", l % 8);
+            assert_eq!((v[24], v[25]), (init32, want_i32), "{backend} lane {l} case {}: ds_cmpst_rtn_b32 control (old, cell)", l % 8);
+            // 2) 32-bit buffer / global / flat + int control
+            assert_eq!((v[14], r.mem[(0x0200 + 4 * l) / 4]), (init32, want_f32), "{backend} lane {l} case {}: buffer_atomic_fcmpswap", l % 8);
+            assert_eq!((v[26], r.mem[(0x0400 + 4 * l) / 4]), (init32, want_f32), "{backend} lane {l} case {}: global_atomic_fcmpswap", l % 8);
+            assert_eq!((v[27], r.mem[(0x0500 + 4 * l) / 4]), (init32, want_f32), "{backend} lane {l} case {}: flat_atomic_fcmpswap", l % 8);
+            assert_eq!((v[28], r.mem[(0x0600 + 4 * l) / 4]), (init32, want_i32), "{backend} lane {l} case {}: global_atomic_cmpswap control", l % 8);
+            // 3) 32-bit image UAV + int control
+            assert_eq!((v[18], tex32(0, l)), (init32, want_f32), "{backend} lane {l} case {}: image_atomic_fcmpswap", l % 8);
+            assert_eq!((v[20], tex32(1, l)), (init32, want_i32), "{backend} lane {l} case {}: image_atomic_cmpswap control", l % 8);
+            // 4) 64-bit buffer / global / flat + int control
+            assert_eq!((old64(v, 30), cell64(0x0A00 + 8 * l)), (init64, want_f64), "{backend} lane {l} case {}: buffer_atomic_fcmpswap_x2", l % 8);
+            assert_eq!((old64(v, 40), cell64(0x0C00 + 8 * l)), (init64, want_f64), "{backend} lane {l} case {}: global_atomic_fcmpswap_x2", l % 8);
+            assert_eq!((old64(v, 42), cell64(0x0E00 + 8 * l)), (init64, want_f64), "{backend} lane {l} case {}: flat_atomic_fcmpswap_x2", l % 8);
+            assert_eq!((old64(v, 44), cell64(0x1000 + 8 * l)), (init64, want_i64), "{backend} lane {l} case {}: global_atomic_cmpswap_x2 control", l % 8);
+        }
     }
 }
 
