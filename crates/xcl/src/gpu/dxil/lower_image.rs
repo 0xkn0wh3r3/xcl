@@ -764,6 +764,32 @@ impl Lw {
             for &t in &tmps {
                 self.wr(t, z);
             }
+            // DIM 1D / 2D on a 2D MSAA (TYPE 14) or MSAA-array (TYPE 15) T#: RDNA2 gives
+            // (width, height, 0, 1) (AnyPS5 docs/dev/debt/shader.md, gfx1036). The host view is
+            // multisampled, so it is queried as one: a Texture1D / Texture2D handle on it leaves
+            // the level count to the host (RADV: log2(samples) + 1).
+            let mut run = run;
+            if matches!(dim, 0 | 1) {
+                let rtype = self.lshrc(tw3, 28);
+                for (ty, mkind) in [(14, TexKind::D2MS), (15, TexKind::D2MSArray)] {
+                    let is = self.cmpc(Pred::Eq, rtype, ty);
+                    let go = self.land(run, is);
+                    self.guarded(go, &mut |lw| {
+                        let tex = lw.s.heap_texture(tw0, mkind, false, CompType::F32, 4, true);
+                        let dims = lw.s.get_dimensions(tex.handle, None);
+                        let w = lw.s.m.extract(dims, 0);
+                        let hh = lw.s.m.extract(dims, 1);
+                        let (zero, one) = (lw.c(0), lw.c(1));
+                        for (k, v) in [w, hh, zero, one].into_iter().enumerate() {
+                            lw.wr(tmps[k], v);
+                        }
+                        Ok(())
+                    })?;
+                }
+                let ms_t = self.cmpc(Pred::UGe, rtype, 14);
+                let not_ms = self.lnot(ms_t);
+                run = self.land(run, not_ms);
+            }
             self.guarded(run, &mut |lw| {
                 let tex = lw.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
                 let dims = lw.s.get_dimensions(tex.handle, Some(mipv));

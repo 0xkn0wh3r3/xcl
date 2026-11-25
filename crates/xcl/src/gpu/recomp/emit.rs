@@ -2828,7 +2828,24 @@ impl Em {
                 _ => return Err("get_resinfo dim"),
             };
             self.line(&format!("uint4 {t}_r = uint4(0u, 0u, 0u, 0u);"));
-            self.line(&format!("if (and({act}, {t}_ok)) {{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}"));
+            let query = format!("{{ {ty}<float4> {t}_T = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {t}_d, {t}_n; {call} {t}_r = uint4({t}_w, {t}_h, {t}_d, {t}_n); }}");
+            let query = if matches!(dim, 0 | 1) {
+                // DIM 1D / 2D on a 2D MSAA (TYPE 14) or MSAA-array (TYPE 15) T#: RDNA2 gives
+                // (width, height, 0, 1) (AnyPS5 docs/dev/debt/shader.md, gfx1036). The host view is
+                // multisampled, so it is queried as one: a Texture1D / Texture2D handle on it leaves
+                // the level count to the host (RADV: log2(samples) + 1).
+                let ms = |ty: &str, extra: &str| {
+                    format!("{{ {ty}<float4> {t}_M = ResourceDescriptorHeap[NonUniformResourceIndex({tw0})]; uint {t}_w, {t}_h, {extra}{t}_s; {t}_M.GetDimensions({t}_w, {t}_h, {extra}{t}_s); {t}_r = uint4({t}_w, {t}_h, 0u, 1u); }}")
+                };
+                format!(
+                    "if (({tw3} >> 28) == 14u) {} else if (({tw3} >> 28) == 15u) {} else {query}",
+                    ms("Texture2DMS", ""),
+                    ms("Texture2DMSArray", &format!("{t}_e, "))
+                )
+            } else {
+                query
+            };
+            self.line(&format!("if (and({act}, {t}_ok)) {{ {query} }}"));
             let comps2 = comps.clone();
             write_result(self, &format!("{t}_r"), comps.len(), &move |k| comps2[k], &|e: &str| e.to_string());
             return Ok(());

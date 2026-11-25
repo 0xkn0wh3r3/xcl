@@ -9028,8 +9028,10 @@ fn gpu_scalar_sext_mulhi_and_vector_i24_sub_co_ci_u64_shifts() {
     }
 }
 
-/// image_get_resinfo with DIM 2D on a 2D MSAA T# (TYPE 14) gives (width, height, 0, 1) on RDNA2
-/// (AnyPS5#25723). A 4x2 texture of 4 samples.
+/// image_get_resinfo with DIM 1D or 2D on a 2D MSAA T# (TYPE 14) or a 2D MSAA-array T# (TYPE 15)
+/// gives (width, height, 0, 1) on RDNA2 (AnyPS5#25723, gfx1036). A 4x2 texture of 4 samples, and
+/// a 4x2 array of 3 slices of 4 samples. The level count is 1 on every host: queried through a
+/// Texture2D handle, the multisampled view reported log2(samples) + 1 = 3 on RADV.
 #[test]
 fn gpu_image_get_resinfo_dim_2d_of_an_msaa_tsharp() {
     if !gpu_ready() {
@@ -9037,14 +9039,27 @@ fn gpu_image_get_resinfo_dim_2d_of_an_msaa_tsharp() {
     }
     use runner::{TestTexture, TexDim};
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
-    let mut code = encode("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", 20), ("VADDR", 3), ("SRSRC", 4), ("DMASK", 0xF), ("DIM", 1)], None).unwrap();
+    let mimg = |vdata: u64, srsrc: u64, dim: u64| encode("IMAGE_GET_RESINFO", "ENC_MIMG", &[("VDATA", vdata), ("VADDR", 3), ("SRSRC", srsrc), ("DMASK", 0xF), ("DIM", dim)], None).unwrap();
+    // T# 14 in s[16:23], T# 15 in s[24:31]; DIM 2D, then DIM 1D, on each
+    let mut code = Vec::new();
+    code.extend(mimg(20, 4, 1));
+    code.extend(mimg(24, 4, 0));
+    code.extend(mimg(28, 6, 1));
+    code.extend(mimg(32, 6, 0));
     code.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
     let mut st = KernelState::default();
     st.sgpr[16..24].copy_from_slice(&tsharp(0, 77, 14));
+    st.sgpr[24..32].copy_from_slice(&tsharp(2, 77, 15));
     for r in st.vgpr.iter_mut() {
         r[3] = 0;
     }
-    let tex = [TestTexture { dim: TexDim::D2Ms(4), format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 2, depth: 1, texel_bytes: 16, data: vec![0; 4 * 2 * 4 * 16], uav: false }];
+    let tex = [
+        TestTexture { dim: TexDim::D2Ms(4), format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 2, depth: 1, texel_bytes: 16, data: vec![0; 4 * 2 * 4 * 16], uav: false },
+        TestTexture { dim: TexDim::D2MsArray(4), format: DXGI_FORMAT_R32G32B32A32_FLOAT, width: 4, height: 2, depth: 3, texel_bytes: 16, data: vec![0; 3 * 4 * 2 * 4 * 16], uav: false },
+    ];
     let r = runner::run_code_with(&code, &st, &[], &tex, &[]).unwrap();
     assert_eq!(&r.vgpr[0][20..24], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 2D on a 4-sample T#");
+    assert_eq!(&r.vgpr[0][24..28], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 1D on a 4-sample T#");
+    assert_eq!(&r.vgpr[0][28..32], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 2D on a 4-sample array T#");
+    assert_eq!(&r.vgpr[0][32..36], &[4, 2, 0, 1], "resinfo (w, h, d, mips) of DIM 1D on a 4-sample array T#");
 }
