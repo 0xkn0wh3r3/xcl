@@ -9647,3 +9647,49 @@ fn gpu_compute_coherent_and_cached_loads() {
         }
     }
 }
+
+#[test]
+fn gpu_v_dot8_u32_u4_edge_cases() {
+    const CASES: [(u32, u32, u32); 16] = [
+        (0, 0, 0),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0),
+        (0x0F0F_0F0F, 0x0F0F_0F0F, 123),
+        (0xF0F0_F0F0, 0xF0F0_F0F0, 456),
+        (0x0F0F_0F0F, 0xF0F0_F0F0, 0x1234_5678),
+        (0x0123_4567, 0x89AB_CDEF, 0x1111_2222),
+        (0xFEDC_BA98, 0x7654_3210, 0),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_F8F7), // exact u32::MAX with sum 8*15*15 = 1800 (0x708): 0xFFFF_F8F7 + 0x708 = 0xFFFF_FFFF
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_F8F8), // wraps to 0 unclamped, saturates to u32::MAX clamped
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFF0),
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF),
+        (0x8888_8888, 0x9999_9999, 0xFFFF_FE00),
+        (0x1010_1010, 0x0204_0608, 0),
+        (0x0102_0304, 0x0506_0708, 0x8000_0000),
+        (0xA5A5_5A5A, 0x5A5A_A5A5, 0x7FFF_FFFF),
+        (0x0000_000F, 0x0000_000F, 0xFFFF_FF1F),
+    ];
+    let p = prog(&[
+        ("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)], None),
+        ("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", 4), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2), ("CLAMP", 1)], None),
+    ]);
+    let dot_u4 = |a: u32, b: u32, c: u32, clamp: bool| -> u32 {
+        let mut sum = c as u64;
+        for i in 0..8 {
+            sum += (((a >> (4 * i)) & 0xF) * ((b >> (4 * i)) & 0xF)) as u64;
+        }
+        if clamp { sum.min(u32::MAX as u64) as u32 } else { sum as u32 }
+    };
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            let (a, b, c) = CASES[l % CASES.len()];
+            (r[0], r[1], r[2]) = (a, b, c);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, b, c) = CASES[l % CASES.len()];
+            assert_eq!(v[3], dot_u4(a, b, c, false), "wave{lanes} lane {l} unclamped v_dot8_u32_u4({a:#x}, {b:#x}, {c:#x})");
+            assert_eq!(v[4], dot_u4(a, b, c, true), "wave{lanes} lane {l} clamped v_dot8_u32_u4({a:#x}, {b:#x}, {c:#x})");
+        }
+    }
+}

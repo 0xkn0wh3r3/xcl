@@ -102,6 +102,17 @@ impl Lw {
             }
             "v_dot4_u32_u8" => Some(self.dot_n(src(0), src(1), src(2), 8, false, clamp)),
             "v_dot4_i32_i8" => Some(self.dot_n(src(0), src(1), src(2), 8, true, clamp)),
+            "v_dot8_u32_u4" if !clamp => {
+                let (a, b, c) = (src(0), src(1), src(2));
+                let a_lo = self.andc(a, 0x0F0F_0F0F);
+                let b_lo = self.andc(b, 0x0F0F_0F0F);
+                let a_hi = self.lshrc(a, 4);
+                let a_hi = self.andc(a_hi, 0x0F0F_0F0F);
+                let b_hi = self.lshrc(b, 4);
+                let b_hi = self.andc(b_hi, 0x0F0F_0F0F);
+                let t = self.s.dot4_add_u8_packed(c, a_lo, b_lo);
+                Some(self.s.dot4_add_u8_packed(t, a_hi, b_hi))
+            }
             "v_dot8_u32_u4" => Some(self.dot_n(src(0), src(1), src(2), 4, false, clamp)),
             "v_dot8_i32_i4" => Some(self.dot_n(src(0), src(1), src(2), 4, true, clamp)),
             _ => None,
